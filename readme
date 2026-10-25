@@ -1,0 +1,75 @@
+# HEC-Vortex Rainfall Preprocessor
+
+**From a spatial design-storm raster to time-stamped precipitation grids for HEC-RAS Rain-on-Grid modelling.**
+
+`Python` · `GeoTIFF` · `HEC-Vortex` · `Rain-on-Grid` · `Hydroinformatics`
+
+## Why this tool?
+
+**HEC-Vortex imports precipitation grids into HEC-DSS, but it does not construct a design storm's temporal distribution from a total-depth raster.**
+
+This preprocessor fills that step. It transforms a **total event rainfall raster** into a sequence of **time-stamped GeoTIFF grids**, which can then be imported into **HEC-Vortex** and converted to **HEC-DSS** for HEC-RAS 2D.
+
+> **Important:** The preprocessor generates GeoTIFF time steps. **HEC-Vortex**, not this application, performs the subsequent DSS import/conversion.
+
+## Main capabilities
+
+- Generate temporal rainfall distributions using **seven methods**:
+  - SCS/NRCS Types **I, IA, II and III**
+  - **Alternating Blocks** from an IDF relationship
+  - **Triangular** hyetograph
+  - **Observed** rainfall hyetograph
+- Convert rainfall depth into per-time-step, georeferenced grids.
+- Clip/mask by catchment boundary, with controlled treatment of missing raster values.
+- Preserve the source raster's spatial reference and affine transform across outputs.
+- Preview the resulting hyetograph and cumulative rainfall curve.
+- Apply mass-conservation checks when writing rainfall grids.
+
+## Workflow
+
+```text
+Total rainfall GeoTIFF + catchment boundary
+                    |
+        Rainfall Preprocessor
+       (temporal distribution)
+                    |
+   Time-stamped GeoTIFF rainfall grids
+                    |
+              HEC-Vortex
+                    |
+                HEC-DSS
+                    |
+        HEC-RAS 2D Rain-on-Grid
+```
+
+## Quality controls
+
+- Monotonic cumulative-rainfall interpolation with **PCHIP** when applicable.
+- Temporal fractions normalized to conserve total precipitation depth.
+- Post-write raster check, with a documented warning threshold of **0.01 mm** for maximum depth difference.
+- Checks for georeferencing consistency and unresolved missing data.
+
+## Example from the case study
+
+A documented demonstration used a **24-hour** design storm with a **5-minute** time step, generating **288 rainfall grids** for subsequent HEC-Vortex import.
+
+## Verification and limitations
+
+- The spatial and temporal preprocessing workflow was documented and exercised on case-study data.
+- A **quantitative end-to-end check of the rainfall actually imported into DSS** was still identified as a follow-up validation task in the report.
+- For SCS Types **I and III**, exact numerical agreement with official fine-resolution reference tables was not independently established; additional verification is needed before regulatory use.
+- Synthetic rainfall distributions are not automatically representative of the local rainfall climate. Appropriate parameter selection and validation remain the user's responsibility.
+
+## Project status
+
+**Portfolio documentation / source-code release pending.** Source files, exact dependencies, installation/run instructions and an anonymized screenshot will be added after the release package has been checked and publication rights confirmed.
+
+## Context and authorship
+
+Developed by **Mohamed Ikbal EL AGADI** during an internship at **BHS Engineering**, in the context of spatially distributed hydrological–hydraulic modelling for the **Tensift basin**, with a pilot application to **Chichaoua, Morocco**.
+
+This is an independent tool, **not official USACE/HEC-Vortex software**, and no affiliation or endorsement is implied.
+
+## License
+
+No open-source license has been assigned yet. A license will be selected only after code ownership and permission to publish have been confirmed.
