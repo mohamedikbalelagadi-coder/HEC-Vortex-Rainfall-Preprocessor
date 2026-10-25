@@ -1,0 +1,2541 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+============================================================================
+ HEC-VORTEX PREPROCESSOR - Pluie de Projet  (Application de bureau)
+ HEC-VORTEX PREPROCESSOR - Design Storm  (Desktop Application)
+============================================================================
+Pre-processeur graphique bilingue (FR/EN) pour la pluie de projet, avant
+import dans l'outil "Importer" de HEC-Vortex.
+
+Pipeline (dans cet ordre strict) :
+  0. Stress climatique  : matrice_brute *= (1 + stress_pct / 100)
+  1. Zero-Padding       : NoData -> 0.0 hors polygone (+ marge tampon),
+                           comblement par interpolation des NoData internes
+  2. Distribution temporelle : une des methodes ci-dessous transforme le
+     raster "propre" (cumul total) en N grilles temporelles, chacune egale
+     au raster propre multiplie par une fraction (les fractions de chaque
+     methode sont normalisees pour sommer a 1.0 - le volume total reste
+     donc celui du raster d'entree ; seule sa repartition dans le temps
+     change selon la methode choisie) :
+
+     I    SCS Type I    (NRCS, pas de temps dynamique)
+     IA   SCS Type IA   (NRCS, pas de temps dynamique)
+     II   SCS Type II   (NRCS, pas de temps dynamique)
+     III  SCS Type III  (NRCS, pas de temps dynamique)
+     B    SCS (saisie manuelle)          - 24 valeurs fournies par l'utilisateur
+     C    Methode des blocs alternes     - I = a.t^-b, rearrangement en blocs
+     D    Hyetogramme triangulaire       - base = duree, sommet a t = r.duree
+     E    Pluie historique (fichier)     - fractions lues dans un .txt/.csv
+
+Interface : tkinter + tkinter.ttk, bilingue FR/EN (bouton de bascule). Le
+traitement s'execute dans un thread separe ; les logs remontent via une
+file (queue) thread-safe. Un panneau graphique (matplotlib) affiche DEUX
+graphiques : (1) l'hyetogramme exact (barres, mm) + sa courbe cumulee
+CHRONOLOGIQUE REELLE (mm) sur un axe secondaire, et (2) un comparateur
+adimensionnel t/t24 vs P/P24 superposant les 4 courbes SCS standard et la
+courbe de la methode actuellement calculee, pour verification visuelle de
+sa coherence avec les distributions officielles.
+
+Georeferencement (Rasterio) : le CRS et la Transform Affine sont captures
+UNE SEULE FOIS a la lecture du raster source et reutilises tels quels
+(jamais recalcules) pour le masque geometrique du Zero-Padding et pour
+CHAQUE grille de sortie - voir les commentaires de PreprocesseurRaster
+pour le detail des garanties apportees contre tout decalage spatial.
+
+Dependances : rasterio, geopandas, numpy, matplotlib   (obligatoires)
+              scipy                                     (optionnelle : PCHIP)
+              pip install rasterio geopandas numpy matplotlib scipy
+============================================================================
+"""
+
+import gc
+import queue
+import re
+import sys
+import threading
+import traceback
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+import numpy as np
+
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
+try:
+    from scipy.interpolate import PchipInterpolator
+    _SCIPY_DISPONIBLE = True
+except ImportError:
+    PchipInterpolator = None
+    _SCIPY_DISPONIBLE = False
+
+# Date de reference conventionnelle pour les hyetogrammes synthetiques
+# (aucune signification calendaire reelle - c'est un "temps zero" arbitraire,
+# pratique standard en hydrologie pour un evenement de projet). Elle sert
+# uniquement a donner a chaque grille un horodatage UNIQUE et croissant dans
+# son nom de fichier, indispensable pour que HEC-Vortex Importer puisse
+# reconnaitre automatiquement Part D/E (date de debut/fin) de chaque
+# enregistrement DSS - sans quoi toutes les grilles retombent sur le meme
+# chemin DSS et s'ecrasent les unes les autres.
+EPOCH_HYETOGRAMME = datetime(2000, 1, 1, 0, 0)
+
+# Nombre maximal de grilles generees (garde-fou memoire / disque / DSS).
+NB_PAS_MAX = 500
+
+
+# ============================================================================
+# EXCEPTIONS
+# ============================================================================
+
+class ErreurTraitement(Exception):
+    """Exception metier propre, remontee telle quelle jusqu'a la messagebox."""
+    pass
+
+
+# ============================================================================
+# TABLES DE DISTRIBUTION SCS/NRCS 24 HEURES (Type I, IA, II, III)
+# ============================================================================
+# Chaque table est un couple (TEMPS_H, CUMUL) de listes de MEME longueur :
+#   TEMPS_H : temps depuis le debut de l'evenement, en HEURES (0.0 a 24.0)
+#   CUMUL   : fraction CUMULEE adimensionnelle de la pluie totale sur 24 h
+#             (P(t)/P24h), non decroissante, CUMUL[0]=0.0, CUMUL[-1]=1.0
+#
+# TYPE IA et TYPE II : tables a resolution fine (0.1 h, 241 points chacune),
+# reproduites depuis WSDOT Highway Runoff Manual M 31-16, Appendix 4C,
+# Tables 4C-3 (Type IA) et 4C-4 (Type II) - retranscription des distributions
+# synthetiques SCS/NRCS standard (methodologie NRCS/SCS TP-149 et TR-55).
+# Points de controle verifies : Type IA P(7h)=0.268, P(8h)=0.425 ;
+# Type II P(11h)=0.235, P(12h)=0.663 - conformes a la table publiee.
+#
+# TYPE I et TYPE III : table aux points de rupture standard publies de la
+# distribution SCS 24 h (jeu de 23 noeuds : 0, 2, 4, 6, 7, 8, 8.5, 9, 9.5,
+# 9.75, 10, 10.5, 11, 11.5, 11.75, 12, 12.5, 13, 13.5, 14, 16, 20, 24 h),
+# tel que reproduit dans la litterature hydrologique courante a partir de
+# NRCS NEH Part 630 Ch.4 / TR-55 Appendix B. Resolution plus grossiere que
+# IA/II, mais NOEUDS REELS (et non plus une reconstruction par deformation
+# temporelle comme dans la version precedente de ce fichier, qui placait a
+# tort le pic du Type I vers 8 h au lieu de ~10 h).
+#
+# RECOMMANDATION : avant usage reglementaire, recouper ces quatre tables
+# avec la source primaire NRCS applicable a ton projet. Les valeurs
+# intermediaires sont obtenues par interpolation MONOTONE (PCHIP si scipy
+# est installe, sinon lineaire) - voir interpoler_cumul_scs().
+# ============================================================================
+
+TABLE_SCS_TEMPS_H_IA = [
+    0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1,
+    1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2, 2.3,
+    2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 3.0, 3.1, 3.2, 3.3, 3.4, 3.5,
+    3.6, 3.7, 3.8, 3.9, 4.0, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7,
+    4.8, 4.9, 5.0, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.8, 5.9,
+    6.0, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8, 6.9, 7.0, 7.1,
+    7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 8.0, 8.1, 8.2, 8.3,
+    8.4, 8.5, 8.6, 8.7, 8.8, 8.9, 9.0, 9.1, 9.2, 9.3, 9.4, 9.5,
+    9.6, 9.7, 9.8, 9.9, 10.0, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7,
+    10.8, 10.9, 11.0, 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7, 11.8, 11.9,
+    12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7, 12.8, 12.9, 13.0, 13.1,
+    13.2, 13.3, 13.4, 13.5, 13.6, 13.7, 13.8, 13.9, 14.0, 14.1, 14.2, 14.3,
+    14.4, 14.5, 14.6, 14.7, 14.8, 14.9, 15.0, 15.1, 15.2, 15.3, 15.4, 15.5,
+    15.6, 15.7, 15.8, 15.9, 16.0, 16.1, 16.2, 16.3, 16.4, 16.5, 16.6, 16.7,
+    16.8, 16.9, 17.0, 17.1, 17.2, 17.3, 17.4, 17.5, 17.6, 17.7, 17.8, 17.9,
+    18.0, 18.1, 18.2, 18.3, 18.4, 18.5, 18.6, 18.7, 18.8, 18.9, 19.0, 19.1,
+    19.2, 19.3, 19.4, 19.5, 19.6, 19.7, 19.8, 19.9, 20.0, 20.1, 20.2, 20.3,
+    20.4, 20.5, 20.6, 20.7, 20.8, 20.9, 21.0, 21.1, 21.2, 21.3, 21.4, 21.5,
+    21.6, 21.7, 21.8, 21.9, 22.0, 22.1, 22.2, 22.3, 22.4, 22.5, 22.6, 22.7,
+    22.8, 22.9, 23.0, 23.1, 23.2, 23.3, 23.4, 23.5, 23.6, 23.7, 23.8, 23.9,
+    24.0,
+]
+TABLE_SCS_CUMUL_IA = [
+    0.000, 0.002, 0.004, 0.006, 0.008, 0.010, 0.012, 0.014, 0.016, 0.018,
+    0.020, 0.023, 0.026, 0.029, 0.032, 0.035, 0.038, 0.041, 0.044, 0.047,
+    0.050, 0.053, 0.056, 0.060, 0.063, 0.066, 0.069, 0.072, 0.076, 0.079,
+    0.082, 0.085, 0.088, 0.091, 0.095, 0.098, 0.101, 0.105, 0.109, 0.112,
+    0.116, 0.120, 0.123, 0.127, 0.131, 0.135, 0.139, 0.143, 0.147, 0.152,
+    0.156, 0.161, 0.165, 0.170, 0.175, 0.180, 0.185, 0.190, 0.195, 0.200,
+    0.206, 0.212, 0.218, 0.224, 0.231, 0.237, 0.243, 0.249, 0.255, 0.261,
+    0.268, 0.275, 0.283, 0.291, 0.300, 0.310, 0.331, 0.355, 0.379, 0.403,
+    0.425, 0.439, 0.452, 0.462, 0.472, 0.480, 0.489, 0.498, 0.505, 0.513,
+    0.520, 0.527, 0.533, 0.539, 0.545, 0.550, 0.556, 0.561, 0.567, 0.572,
+    0.577, 0.582, 0.587, 0.592, 0.596, 0.601, 0.606, 0.610, 0.615, 0.620,
+    0.624, 0.628, 0.633, 0.637, 0.641, 0.645, 0.649, 0.653, 0.657, 0.660,
+    0.664, 0.668, 0.671, 0.675, 0.679, 0.683, 0.687, 0.690, 0.694, 0.697,
+    0.701, 0.705, 0.708, 0.712, 0.716, 0.719, 0.722, 0.726, 0.729, 0.733,
+    0.736, 0.739, 0.743, 0.746, 0.749, 0.753, 0.756, 0.759, 0.763, 0.766,
+    0.769, 0.772, 0.776, 0.779, 0.782, 0.785, 0.788, 0.792, 0.795, 0.798,
+    0.801, 0.804, 0.807, 0.810, 0.813, 0.816, 0.819, 0.822, 0.825, 0.828,
+    0.831, 0.834, 0.837, 0.840, 0.843, 0.846, 0.849, 0.851, 0.854, 0.857,
+    0.860, 0.863, 0.865, 0.868, 0.871, 0.874, 0.876, 0.879, 0.882, 0.884,
+    0.887, 0.890, 0.892, 0.895, 0.897, 0.900, 0.903, 0.905, 0.908, 0.910,
+    0.913, 0.915, 0.918, 0.920, 0.922, 0.925, 0.927, 0.930, 0.932, 0.934,
+    0.937, 0.939, 0.941, 0.944, 0.946, 0.948, 0.951, 0.953, 0.955, 0.957,
+    0.959, 0.962, 0.964, 0.966, 0.968, 0.970, 0.972, 0.974, 0.976, 0.978,
+    0.980, 0.982, 0.984, 0.986, 0.988, 0.990, 0.992, 0.994, 0.996, 0.998,
+    1.000,
+]
+
+TABLE_SCS_TEMPS_H_II = list(TABLE_SCS_TEMPS_H_IA)
+TABLE_SCS_CUMUL_II = [
+    0.000, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009,
+    0.011, 0.012, 0.013, 0.014, 0.015, 0.016, 0.017, 0.018, 0.020, 0.021,
+    0.022, 0.023, 0.024, 0.026, 0.027, 0.028, 0.029, 0.031, 0.032, 0.033,
+    0.035, 0.036, 0.037, 0.038, 0.040, 0.041, 0.042, 0.044, 0.045, 0.047,
+    0.048, 0.049, 0.051, 0.052, 0.054, 0.055, 0.057, 0.058, 0.060, 0.061,
+    0.063, 0.065, 0.066, 0.068, 0.070, 0.071, 0.073, 0.075, 0.076, 0.078,
+    0.080, 0.082, 0.084, 0.085, 0.087, 0.089, 0.091, 0.093, 0.095, 0.097,
+    0.099, 0.101, 0.103, 0.105, 0.107, 0.109, 0.111, 0.113, 0.116, 0.118,
+    0.120, 0.122, 0.125, 0.127, 0.130, 0.132, 0.135, 0.138, 0.141, 0.144,
+    0.147, 0.150, 0.153, 0.157, 0.160, 0.163, 0.166, 0.170, 0.173, 0.177,
+    0.181, 0.185, 0.189, 0.194, 0.199, 0.204, 0.209, 0.215, 0.221, 0.228,
+    0.235, 0.243, 0.251, 0.261, 0.271, 0.283, 0.307, 0.354, 0.431, 0.568,
+    0.663, 0.682, 0.699, 0.713, 0.725, 0.735, 0.743, 0.751, 0.759, 0.766,
+    0.772, 0.778, 0.784, 0.789, 0.794, 0.799, 0.804, 0.808, 0.812, 0.816,
+    0.820, 0.824, 0.827, 0.831, 0.834, 0.838, 0.841, 0.844, 0.847, 0.850,
+    0.854, 0.856, 0.859, 0.862, 0.865, 0.868, 0.870, 0.873, 0.875, 0.878,
+    0.880, 0.882, 0.885, 0.887, 0.889, 0.891, 0.893, 0.895, 0.898, 0.900,
+    0.902, 0.904, 0.906, 0.908, 0.910, 0.912, 0.914, 0.915, 0.917, 0.919,
+    0.921, 0.923, 0.925, 0.926, 0.928, 0.930, 0.931, 0.933, 0.935, 0.936,
+    0.938, 0.939, 0.941, 0.942, 0.944, 0.945, 0.947, 0.948, 0.949, 0.951,
+    0.952, 0.953, 0.955, 0.956, 0.957, 0.958, 0.960, 0.961, 0.962, 0.964,
+    0.965, 0.966, 0.967, 0.968, 0.970, 0.971, 0.972, 0.973, 0.975, 0.976,
+    0.977, 0.978, 0.979, 0.981, 0.982, 0.983, 0.984, 0.985, 0.986, 0.988,
+    0.989, 0.990, 0.991, 0.992, 0.993, 0.994, 0.996, 0.997, 0.998, 0.999,
+    1.000,
+]
+
+# Points de rupture standard de la distribution SCS 24 h (Types I et III).
+TABLE_SCS_TEMPS_H_I = [
+    0.0, 2.0, 4.0, 6.0, 7.0, 8.0, 8.5, 9.0, 9.5, 9.75, 10.0, 10.5,
+    11.0, 11.5, 11.75, 12.0, 12.5, 13.0, 13.5, 14.0, 16.0, 20.0, 24.0,
+]
+TABLE_SCS_CUMUL_I = [
+    0.000, 0.035, 0.076, 0.125, 0.156, 0.194, 0.219, 0.254, 0.303, 0.362, 0.515, 0.583,
+    0.624, 0.654, 0.669, 0.682, 0.706, 0.727, 0.748, 0.767, 0.830, 0.926, 1.000,
+]
+
+TABLE_SCS_TEMPS_H_III = list(TABLE_SCS_TEMPS_H_I)
+TABLE_SCS_CUMUL_III = [
+    0.000, 0.020, 0.043, 0.072, 0.089, 0.115, 0.130, 0.148, 0.167, 0.178, 0.189, 0.216,
+    0.250, 0.298, 0.339, 0.500, 0.702, 0.751, 0.785, 0.811, 0.886, 0.957, 1.000,
+]
+
+TABLES_SCS = {
+    "I":   (TABLE_SCS_TEMPS_H_I,   TABLE_SCS_CUMUL_I),
+    "IA":  (TABLE_SCS_TEMPS_H_IA,  TABLE_SCS_CUMUL_IA),
+    "II":  (TABLE_SCS_TEMPS_H_II,  TABLE_SCS_CUMUL_II),
+    "III": (TABLE_SCS_TEMPS_H_III, TABLE_SCS_CUMUL_III),
+}
+
+
+def _controler_tables_scs():
+    """Controle d'integrite execute a l'import : chaque table doit avoir des
+    listes de meme longueur, un temps strictement croissant de 0 a 24 h et un
+    cumul non decroissant de 0.0 a 1.0. Une table corrompue lors d'une edition
+    manuelle serait ainsi detectee immediatement, et non silencieusement."""
+    for type_scs, (temps_h, cumul) in TABLES_SCS.items():
+        if len(temps_h) != len(cumul) or len(temps_h) < 2:
+            raise ErreurTraitement(
+                "[Table SCS {}] Longueurs incoherentes : {} temps / {} cumuls.".format(
+                    type_scs, len(temps_h), len(cumul)))
+        if abs(temps_h[0]) > 1e-9 or abs(temps_h[-1] - 24.0) > 1e-9:
+            raise ErreurTraitement(
+                "[Table SCS {}] Le temps doit aller de 0.0 h a 24.0 h.".format(type_scs))
+        if abs(cumul[0]) > 1e-9 or abs(cumul[-1] - 1.0) > 1e-9:
+            raise ErreurTraitement(
+                "[Table SCS {}] Le cumul doit aller de 0.0 a 1.0.".format(type_scs))
+        for k in range(1, len(temps_h)):
+            if temps_h[k] <= temps_h[k - 1]:
+                raise ErreurTraitement(
+                    "[Table SCS {}] Temps non strictement croissant a l'indice {}.".format(type_scs, k))
+            if cumul[k] < cumul[k - 1]:
+                raise ErreurTraitement(
+                    "[Table SCS {}] Cumul decroissant a l'indice {}.".format(type_scs, k))
+
+
+# NOTE : _controler_tables_scs() n'est PAS appele ici, au niveau du module.
+# Une exception levee a l'import tuerait le processus avant toute fenetre ;
+# en executable --windowed (PyInstaller) il n'y a ni console ni traceback
+# visible, l'utilisateur ne verrait qu'un plantage silencieux. Le controle
+# est donc effectue au debut de main(), ou l'erreur peut etre presentee
+# dans une messagebox.
+
+
+def interpoler_cumul_scs(type_scs, temps_min_cibles, log=None):
+    """Interpole la courbe cumulee SCS d'un type donne aux instants demandes
+    (en MINUTES). Utilise PchipInterpolator (monotone, sans oscillation entre
+    les noeuds) si scipy est disponible, sinon numpy.interp (lineaire par
+    morceaux, monotone par construction).
+
+    Robustesse : toute valeur non finie renvoyee par l'interpolateur (cas
+    limite aux bornes avec extrapolate=False) est remplacee par la valeur
+    lineaire equivalente, puis la serie est forcee non decroissante et bornee
+    a [0, 1]. Sans ce filet, un NaN traversait le controle de monotonie
+    (NaN < x est toujours faux) et etait converti silencieusement en 0.0,
+    creant un trou dans la courbe cumulee."""
+    type_scs = (type_scs or "").strip().upper()
+    if type_scs not in TABLES_SCS:
+        raise ErreurTraitement(
+            "[SCS] Type de distribution inconnu : '{}' (attendu I, IA, II ou III).".format(type_scs))
+
+    temps_h_noeuds, cumul_noeuds = TABLES_SCS[type_scs]
+    temps_min_noeuds = [t * 60.0 for t in temps_h_noeuds]
+    cibles = [float(t) for t in temps_min_cibles]
+
+    valeurs_lineaires = [float(v) for v in np.interp(cibles, temps_min_noeuds, cumul_noeuds)]
+    if _SCIPY_DISPONIBLE:
+        interpolateur = PchipInterpolator(temps_min_noeuds, cumul_noeuds, extrapolate=False)
+        valeurs = []
+        for t, v_lin in zip(cibles, valeurs_lineaires):
+            v = float(interpolateur(t))
+            valeurs.append(v if np.isfinite(v) else v_lin)
+    else:
+        valeurs = valeurs_lineaires
+        if log is not None:
+            log("  [SCS Type {}] scipy indisponible - interpolation lineaire (numpy.interp) "
+                "utilisee a la place de PCHIP (monotone dans les deux cas).".format(type_scs))
+
+    for k in range(len(valeurs)):
+        if not np.isfinite(valeurs[k]):
+            valeurs[k] = valeurs_lineaires[k]
+        valeurs[k] = min(1.0, max(0.0, valeurs[k]))
+        if k > 0 and valeurs[k] < valeurs[k - 1]:
+            valeurs[k] = valeurs[k - 1]
+    return valeurs
+
+
+# ============================================================================
+# 1. MOTEUR DE DISTRIBUTION TEMPORELLE - logique mathematique pure
+# ============================================================================
+# Chaque methode renvoie un tuple (fractions, minutes_cumulees) :
+#   - fractions        : liste de floats sommant a 1.0 (a 1e-12 pres apres
+#                         normalisation), dans l'ordre chronologique.
+#   - minutes_cumulees : liste d'entiers, temps cumule (minutes) a la FIN de
+#                         chaque pas - utilisee pour calculer l'horodatage de
+#                         chaque fichier de sortie. Tous les fichiers sont
+#                         nommes pluie_YYYY-MM-DD_HHMM.tif (horodatage = FIN
+#                         du pas), a partir d'une date de reference
+#                         conventionnelle (voir EPOCH_HYETOGRAMME).
+#   TOUTES les methodes renvoient desormais des minutes explicites (les
+#   methodes B, D et E renvoyaient None, ce qui forcait en aval un pas
+#   horaire fictif : horodatages DSS faux des que le pas reel n'etait pas
+#   de 60 min).
+# ============================================================================
+
+class MoteurDistributionTemporelle:
+    """Regroupe les methodes de distribution temporelle de la pluie.
+    Toutes les methodes sont des classmethods pures (aucun I/O raster ici),
+    ce qui les rend testables independamment du pipeline spatial."""
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normaliser(fractions, description):
+        """Renormalise une liste de valeurs pour qu'elle somme exactement a
+        1.0, sans exiger qu'elle en soit proche au depart. Utilisee pour les
+        methodes dont les valeurs brutes sont des quantites physiques
+        (hauteurs, aires, pourcentages 0-100...) plutot que des fractions
+        deja normalisees par l'utilisateur."""
+        if not fractions:
+            raise ErreurTraitement("[{}] Liste de fractions vide.".format(description))
+        somme = float(sum(fractions))
+        if not np.isfinite(somme):
+            raise ErreurTraitement(
+                "[{}] Somme non finie (NaN/inf) - calcul interrompu.".format(description))
+        if somme <= 0:
+            raise ErreurTraitement(
+                "[{}] La somme des valeurs doit etre strictement positive (obtenue : {}).".format(
+                    description, somme))
+        return [f / somme for f in fractions]
+
+    @staticmethod
+    def _valider_nombre(valeur, nom_champ):
+        """Valide qu'une valeur est bien un nombre utilisable (defense en
+        profondeur : la GUI convertit deja les saisies en float avant
+        d'appeler le moteur, mais ces methodes doivent rester sures si
+        appelees directement, p.ex. depuis un futur script/CLI)."""
+        if valeur is None:
+            raise ErreurTraitement("[{}] Valeur manquante.".format(nom_champ))
+        if isinstance(valeur, bool) or not isinstance(valeur, (int, float)):
+            try:
+                valeur = float(str(valeur).strip().replace(",", "."))
+            except (ValueError, TypeError):
+                raise ErreurTraitement(
+                    "[{}] '{}' n'est pas un nombre valide.".format(nom_champ, valeur))
+        valeur = float(valeur)
+        if not np.isfinite(valeur):
+            raise ErreurTraitement("[{}] Valeur non finie (NaN/inf).".format(nom_champ))
+        return valeur
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _valider_pas_min(pas_min, description):
+        """Garde-fou commun a TOUTES les methodes a pas de temps dynamique :
+        le pas doit etre >= 1 minute. Les fichiers de sortie sont horodates
+        a la minute pres (pluie_YYYY-MM-DD_HHMM.tif) ; avec un pas < 1 min,
+        deux pas consecutifs pourraient arrondir sur la MEME minute et le
+        second fichier ecraserait alors silencieusement le premier."""
+        if pas_min < 1.0:
+            raise ErreurTraitement(
+                "[{}] Le pas de temps doit etre >= 1 minute (resolution des noms de "
+                "fichiers pluie_YYYY-MM-DD_HHMM.tif) - recu {} min. Un pas < 1 min provoquerait "
+                "des collisions de noms de fichiers et une perte silencieuse de pas de "
+                "temps.".format(description, pas_min))
+
+    @staticmethod
+    def _valider_nombre_de_pas(n, description):
+        if n < 1:
+            raise ErreurTraitement(
+                "[{}] Duree / pas de temps donne moins d'un intervalle.".format(description))
+        if n > NB_PAS_MAX:
+            raise ErreurTraitement(
+                "[{}] {} intervalles calcules (duree/pas) - c'est excessif (plus de {} rasters "
+                "a generer). Augmente le pas de temps.".format(description, n, NB_PAS_MAX))
+
+    @staticmethod
+    def _verifier_horodatages(temps_min, description):
+        """Verifie que les horodatages (minutes, arrondis a l'entier) sont
+        STRICTEMENT croissants. Deux pas tombant sur la meme minute
+        produiraient deux fois le meme nom de fichier, donc un ecrasement
+        silencieux d'une grille par la suivante."""
+        for k in range(1, len(temps_min)):
+            if temps_min[k] <= temps_min[k - 1]:
+                raise ErreurTraitement(
+                    "[{}] Horodatages non strictement croissants (pas {} -> pas {} : {} min -> "
+                    "{} min) - arret pour eviter d'ecraser un fichier de sortie.".format(
+                        description, k, k + 1, temps_min[k - 1], temps_min[k]))
+
+    @classmethod
+    def _grille_de_temps(cls, duree_min, pas_min, description, log=None):
+        """Construit la grille temporelle commune a toutes les methodes a pas
+        dynamique : n pas couvrant EXACTEMENT la duree demandee (pas effectif
+        = duree/n), afin d'eviter toute derive silencieuse de la duree totale
+        quand la duree n'est pas un multiple exact du pas demande.
+        Renvoie (n, pas_min_effectif, temps_min_arrondis)."""
+        n = int(round(duree_min / pas_min))
+        cls._valider_nombre_de_pas(n, description)
+        pas_min_effectif = duree_min / n
+        if log is not None and abs(pas_min_effectif - pas_min) > 1e-6:
+            log("  [{}] Pas de temps ajuste : {:.4f} min demande -> {:.4f} min effectif "
+                "(pour que {} pas couvrent exactement {:.1f} min).".format(
+                    description, pas_min, pas_min_effectif, n, duree_min))
+        temps_min = [int(round(k * pas_min_effectif)) for k in range(0, n + 1)]
+        cls._verifier_horodatages(temps_min, description)
+        return n, pas_min_effectif, temps_min
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def methode_scs_officiel(cls, type_scs: str, pas_min: float, log=None):
+        """Methodes A - Distributions synthetiques 24 h NRCS/SCS (Type I, IA,
+        II ou III). Voir TABLES_SCS en tete de fichier pour la provenance
+        exacte de chaque table.
+
+        Algorithme (pas de temps DYNAMIQUE) :
+          1. Les noeuds (TEMPS_H, CUMUL) sont interpoles par une fonction
+             MONOTONE (PCHIP si scipy est disponible, sinon lineaire).
+          2. La courbe interpolee est echantillonnee exactement aux pas de
+             temps demandes, avec un pas EFFECTIF ajuste pour que n pas
+             couvrent exactement 24 h pile.
+          3. Les cumuls echantillonnes sont forces a 0.0 au debut et 1.0 a la
+             fin, contraints non decroissants, puis convertis en increments
+             renormalises a somme = 1.0 exactement.
+        """
+        type_scs = (type_scs or "").strip().upper()
+        if type_scs not in TABLES_SCS:
+            raise ErreurTraitement(
+                "[SCS] Type de distribution inconnu : '{}' (attendu I, IA, II ou III).".format(type_scs))
+        description = "SCS Type {}".format(type_scs)
+        pas_min = cls._valider_nombre(pas_min, description + " - pas de temps (min)")
+        cls._valider_pas_min(pas_min, description)
+
+        duree_min = 24.0 * 60.0
+        n, pas_min_effectif, temps_min_echant = cls._grille_de_temps(
+            duree_min, pas_min, description, log=log)
+
+        # On interpole sur les temps EXACTS (non arrondis) pour ne pas
+        # introduire de bruit sur la forme de la courbe ; les temps arrondis
+        # ne servent qu'a l'horodatage des fichiers.
+        temps_exacts = [k * pas_min_effectif for k in range(0, n + 1)]
+        cumul_echant = interpoler_cumul_scs(type_scs, temps_exacts, log=log)
+
+        cumul_echant[0] = 0.0
+        cumul_echant[-1] = 1.0
+        for k in range(1, len(cumul_echant)):
+            if cumul_echant[k] < cumul_echant[k - 1]:
+                cumul_echant[k] = cumul_echant[k - 1]
+
+        increments = [cumul_echant[k] - cumul_echant[k - 1] for k in range(1, len(cumul_echant))]
+        fractions = cls._normaliser(increments, description)
+        return fractions, temps_min_echant[1:]
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def methode_b_scs_manuel(cls, texte_saisi: str, pas_min: float = 60.0, log=None):
+        """Methode B - 24 valeurs saisies manuellement par l'utilisateur,
+        separees par des virgules (une par pas de temps). La somme est
+        acceptee si elle vaut ~1.0 (fractions) OU ~100 (pourcentages) :
+        l'unite est auto-detectee puis la liste est renormalisee a 1.0 sans
+        jamais changer la FORME de la distribution."""
+        if not texte_saisi or not texte_saisi.strip():
+            raise ErreurTraitement(
+                "[SCS manuel] Aucune valeur saisie. Colle 24 valeurs separees par des virgules.")
+
+        description = "SCS manuel"
+        pas_min = cls._valider_nombre(pas_min, description + " - pas de temps (min)")
+        cls._valider_pas_min(pas_min, description)
+
+        # Separateurs acceptes : virgule, point-virgule, tabulation, espace,
+        # retour a la ligne. La virgule decimale n'est donc PAS acceptee ici
+        # (elle serait indistinguable d'un separateur de valeurs) : utiliser
+        # le point decimal.
+        morceaux = [m for m in re.split(r"[,;\t\r\n ]+", texte_saisi.strip()) if m != ""]
+        valeurs = []
+        for i, morceau in enumerate(morceaux, start=1):
+            try:
+                valeurs.append(float(morceau))
+            except ValueError:
+                raise ErreurTraitement(
+                    "[SCS manuel] Valeur n {} invalide : '{}' n'est pas un nombre (utilise le "
+                    "point comme separateur decimal).".format(i, morceau))
+
+        if len(valeurs) != 24:
+            raise ErreurTraitement(
+                "[SCS manuel] {} valeur(s) trouvee(s), 24 attendues exactement.".format(len(valeurs)))
+        if any(v < 0 for v in valeurs):
+            raise ErreurTraitement("[SCS manuel] Les valeurs doivent toutes etre positives ou nulles.")
+
+        somme = sum(valeurs)
+        if abs(somme - 1.0) <= 1e-3:
+            pass
+        elif abs(somme - 100.0) <= 1e-1:
+            if log is not None:
+                log("  [SCS manuel] Somme = {:.4f} -> valeurs interpretees comme des POURCENTAGES "
+                    "et renormalisees a 1.0.".format(somme))
+        else:
+            raise ErreurTraitement(
+                "[SCS manuel] La somme des 24 valeurs vaut {:.6f} ; attendu 1.0 (fractions, "
+                "+/- 0.001) ou 100 (pourcentages, +/- 0.1).".format(somme))
+
+        fractions = cls._normaliser(valeurs, description)
+        n = len(fractions)
+        temps_min = [int(round(k * pas_min)) for k in range(0, n + 1)]
+        cls._verifier_horodatages(temps_min, description)
+        return fractions, temps_min[1:]
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def methode_c_blocs_alternes(cls, a: float, b: float, duree_h: float, pas_min: float, log=None):
+        """Methode C - Methode des blocs alternes, a partir d'une loi
+        Intensite-Duree I(t) = a . t^-b (I en mm/h, t en MINUTES depuis le
+        debut de l'episode). Recalibrer a/b si ta courbe IDF est parametree
+        en heures.
+
+        Algorithme (Chow, Maidment & Mays, "Applied Hydrology") :
+          1. Hauteur cumulee P(t_k) = I(t_k) * (t_k / 60) pour chaque pas k
+             (P(0) = 0 par convention, la formule etant singuliere en t=0).
+          2. Increments dP_k = P(t_k) - P(t_{k-1}), tries par ordre decroissant.
+          3. Rearrangement : le plus grand increment est place au CENTRE
+             de la duree totale (indice (n-1)//2, 0-indexe), puis les
+             increments suivants alternent a droite puis a gauche par ordre
+             decroissant.
+          Absence de debordement d'indice : pour tout n >= 1, le nombre de
+          creneaux a droite du centre (n-1-centre) et a gauche (centre) est
+          exactement egal au nombre de valeurs alternees affectees a chaque
+          cote (ceil/floor de (n-1)/2).
+
+        Remarque sur 'a' : les increments sont tous proportionnels a 'a', qui
+        s'annule donc exactement lors de la renormalisation finale. 'a' est
+        demande pour rester coherent avec la formule IDF affichee, mais SEUL
+        'b' influence la forme du hyetogramme normalise."""
+        description = "Blocs alternes"
+        a = cls._valider_nombre(a, description + " - parametre a (mm/h, a t=1 min)")
+        b = cls._valider_nombre(b, description + " - parametre b (exposant, sans unite)")
+        duree_h = cls._valider_nombre(duree_h, description + " - duree totale (h)")
+        pas_min = cls._valider_nombre(pas_min, description + " - pas de temps (min)")
+
+        if a <= 0:
+            raise ErreurTraitement("[Blocs alternes] Le parametre 'a' doit etre strictement positif.")
+        if duree_h <= 0:
+            raise ErreurTraitement("[Blocs alternes] La duree totale doit etre strictement positive.")
+        cls._valider_pas_min(pas_min, description)
+
+        duree_min = duree_h * 60.0
+        n, pas_min_effectif, temps_min = cls._grille_de_temps(duree_min, pas_min, description, log=log)
+
+        profondeurs_cumulees = [0.0]
+        for k in range(1, n + 1):
+            t = k * pas_min_effectif              # minutes (valeur exacte)
+            intensite = a * (t ** (-b))           # mm/h
+            profondeurs_cumulees.append(intensite * (t / 60.0))   # mm
+
+        increments = [profondeurs_cumulees[k] - profondeurs_cumulees[k - 1] for k in range(1, n + 1)]
+        if any(inc < 0 for inc in increments):
+            raise ErreurTraitement(
+                "[Blocs alternes] La loi I=a.t^-b donne une hauteur cumulee non croissante avec ces "
+                "parametres (a={}, b={}) - verifie le signe/la valeur de b.".format(a, b))
+
+        increments_tries = sorted(increments, reverse=True)
+        resultat = [0.0] * n
+        centre = (n - 1) // 2
+        resultat[centre] = increments_tries[0]
+        gauche = centre
+        droite = centre
+        vers_la_droite = True
+        for valeur in increments_tries[1:]:
+            if vers_la_droite:
+                droite += 1
+                resultat[droite] = valeur
+            else:
+                gauche -= 1
+                resultat[gauche] = valeur
+            vers_la_droite = not vers_la_droite
+
+        fractions = cls._normaliser(resultat, description)
+        return fractions, temps_min[1:]
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def methode_d_triangulaire(cls, duree_h: float, r: float, pas_min: float = 60.0, log=None):
+        """Methode D - Hyetogramme triangulaire. Base = duree totale (h),
+        sommet du triangle a t = r * duree (0 < r < 1). Integration exacte de
+        l'aire sous le triangle sur chaque pas (hauteur arbitraire : le
+        resultat est normalise a la fin). Le pas de temps est desormais
+        parametrable (il etait fige a 1 h, ce qui faussait les horodatages
+        des grilles pour toute autre resolution)."""
+        description = "Triangulaire"
+        duree_h = cls._valider_nombre(duree_h, description + " - duree totale (h)")
+        r = cls._valider_nombre(r, description + " - coefficient de pointe r (0-1)")
+        pas_min = cls._valider_nombre(pas_min, description + " - pas de temps (min)")
+        if duree_h <= 0:
+            raise ErreurTraitement("[Triangulaire] La duree totale doit etre strictement positive.")
+        if not (0.0 < r < 1.0):
+            raise ErreurTraitement("[Triangulaire] Le coefficient de pointe r doit etre strictement entre 0 et 1.")
+        cls._valider_pas_min(pas_min, description)
+
+        duree_min = duree_h * 60.0
+        n, pas_min_effectif, temps_min = cls._grille_de_temps(duree_min, pas_min, description, log=log)
+        t_pic_min = r * duree_min
+
+        def aire_cumulee(t):
+            t = min(max(t, 0.0), duree_min)
+            if t <= t_pic_min:
+                return (t ** 2) / (2.0 * t_pic_min) if t_pic_min > 0 else 0.0
+            return duree_min / 2.0 - ((duree_min - t) ** 2) / (2.0 * (duree_min - t_pic_min))
+
+        cumul = [aire_cumulee(k * pas_min_effectif) for k in range(0, n + 1)]
+        increments = [cumul[k] - cumul[k - 1] for k in range(1, len(cumul))]
+        fractions = cls._normaliser(increments, description)
+        return fractions, temps_min[1:]
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def methode_e_historique(cls, chemin_fichier, pas_min: float = 60.0, log=None):
+        """Methode E - Fractions lues dans un fichier .txt/.csv (une valeur
+        par ligne ; si la ligne contient plusieurs colonnes, la DERNIERE est
+        utilisee). Pourcentages ou fractions : l'unite importe peu, la serie
+        est renormalisee a 1.0. Le pas de temps entre deux valeurs est
+        desormais parametrable (il etait suppose horaire)."""
+        description = "Pluie historique"
+        if not chemin_fichier or not Path(chemin_fichier).exists():
+            raise ErreurTraitement("[Pluie historique] Fichier introuvable : {}".format(chemin_fichier))
+        pas_min = cls._valider_nombre(pas_min, description + " - pas de temps (min)")
+        cls._valider_pas_min(pas_min, description)
+
+        chemin_fichier = Path(chemin_fichier)
+        with open(chemin_fichier, "r", encoding="utf-8-sig", errors="replace") as f:
+            contenu = f.read()
+
+        valeurs = []
+        lignes = [l for l in contenu.splitlines() if l.strip() != ""]
+        for i, ligne in enumerate(lignes, start=1):
+            morceaux = [m for m in re.split(r"[,;\t ]+", ligne.strip()) if m != ""]
+            if not morceaux:
+                continue
+            dernier = morceaux[-1].replace(",", ".")
+            try:
+                valeurs.append(float(dernier))
+            except ValueError:
+                # Ligne d'en-tete en premiere position : toleree et ignoree.
+                if i == 1:
+                    if log is not None:
+                        log("  Ligne 1 ignoree (en-tete presume) : '{}'".format(ligne.strip()))
+                    continue
+                raise ErreurTraitement(
+                    "[Pluie historique] Ligne {} illisible : '{}'".format(i, ligne))
+
+        if len(valeurs) < 2:
+            raise ErreurTraitement(
+                "[Pluie historique] {} valeur(s) lue(s) dans le fichier - au moins 2 attendues.".format(
+                    len(valeurs)))
+        if any(v < 0 for v in valeurs):
+            raise ErreurTraitement("[Pluie historique] Le fichier contient des valeurs negatives.")
+        cls._valider_nombre_de_pas(len(valeurs), description)
+
+        if log is not None:
+            log("  {} valeur(s) lue(s), somme brute = {:.4f} (sera renormalisee a 1.0, "
+                "quelle que soit l'unite d'origine - % ou fraction).".format(len(valeurs), sum(valeurs)))
+
+        fractions = cls._normaliser(valeurs, description)
+        n = len(fractions)
+        temps_min = [int(round(k * pas_min)) for k in range(0, n + 1)]
+        cls._verifier_horodatages(temps_min, description)
+        return fractions, temps_min[1:]
+
+
+# ============================================================================
+# 2. LOGIQUE SPATIALE / IO RASTER - climat, zero-padding, ecriture
+# ============================================================================
+# GARANTIE DE GEOREFERENCEMENT :
+#   Le CRS et la Transform Affine sont lus UNE SEULE FOIS dans lire_raster()
+#   et transmis tels quels (jamais recalcules, jamais recomposes a partir
+#   des bounds ou de la resolution) a travers tout le pipeline :
+#     lire_raster -> appliquer_zero_padding (geometry_mask utilise LA MEME
+#     transform que celle lue) -> ecrire_raster (chaque grille de sortie
+#     recoit EXPLICITEMENT ce meme transform/crs, a la fois dans le profil
+#     ET via affectation post-ouverture dst.transform/dst.crs, en double
+#     securite) -> generer_grilles_temporelles verifie, apres ecriture de
+#     la premiere grille, que le fichier reellement ecrit sur disque a bien
+#     la transform attendue (reouverture + comparaison) et interrompt le
+#     traitement si ce n'est pas le cas.
+# ============================================================================
+
+class PreprocesseurRaster:
+    """Encapsule les operations spatiales sur le raster : lecture, stress
+    climatique, zero-padding, ecriture des grilles temporelles. Ne connait
+    rien de tkinter - recoit une fonction `log(message)` en callback, et
+    optionnellement une fonction `callback_progression(pourcentage)` pour
+    faire remonter une avancee deterministe (0-100) a l'UI."""
+
+    def __init__(self, log, callback_progression=None):
+        self.log = log
+        self.callback_progression = callback_progression if callback_progression else (lambda pct: None)
+
+    # ------------------------------------------------------------------
+    def lire_raster(self, chemin_raster):
+        import rasterio
+
+        if not chemin_raster or not Path(chemin_raster).exists():
+            raise ErreurTraitement("[Raster brut] Fichier introuvable : {}".format(chemin_raster))
+        if Path(chemin_raster).stat().st_size == 0:
+            raise ErreurTraitement("[Raster brut] Le fichier existe mais est vide (0 octet).")
+
+        with rasterio.open(chemin_raster) as src:
+            profil = src.profile.copy()
+            # Transform Affine et CRS : captures ICI, UNE SEULE FOIS, et
+            # jamais recalcules ailleurs dans le pipeline.
+            transform = src.transform
+            crs = src.crs
+            nodata = src.nodata
+            nb_bandes = src.count
+            matrice = src.read(1).astype(np.float32)
+            largeur, hauteur = src.width, src.height
+
+        if crs is None:
+            raise ErreurTraitement(
+                "Le raster n'a pas de systeme de coordonnees defini (CRS manquant). "
+                "Corrige la projection dans QGIS avant de relancer le traitement.")
+
+        # Profil de sortie assaini : on impose GTiff/float32/1 bande. Les
+        # parametres de tuilage herites d'un raster source tuile peuvent etre
+        # incompatibles avec une ecriture non tuilee (GDAL leve alors une
+        # erreur peu explicite) : on les retire si le tuilage n'est pas actif.
+        profil.update(driver="GTiff", dtype="float32", count=1)
+        if not profil.get("tiled", False):
+            profil.pop("blockxsize", None)
+            profil.pop("blockysize", None)
+
+        self.log("  Raster source    : {}".format(Path(chemin_raster).name))
+        self.log("  Dimensions       : {} x {} px ({} bande(s), bande 1 utilisee)".format(
+            largeur, hauteur, nb_bandes))
+        self.log("  CRS              : {}".format(crs))
+        self.log("  Transform Affine : {}".format(transform))
+        self.log("  Resolution pixel : {:.4f} x {:.4f} (unites du CRS)".format(
+            abs(transform.a), abs(transform.e)))
+        self.log("  NoData d'origine : {}".format(nodata))
+
+        return matrice, profil, transform, crs, nodata
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def masque_nodata(matrice, nodata):
+        """Masque booleen des pixels NoData (valeur sentinelle ET NaN)."""
+        masque = np.isnan(matrice)
+        if nodata is not None and np.isfinite(nodata):
+            masque = masque | np.isclose(matrice, nodata)
+        return masque
+
+    # ------------------------------------------------------------------
+    def appliquer_stress_climatique(self, matrice, nodata, pourcentage):
+        if pourcentage is None or float(pourcentage) == 0.0:
+            self.log("Stress climatique : 0 % - raster inchange.")
+            self.log("")
+            return matrice
+        facteur = 1.0 + float(pourcentage) / 100.0
+        if facteur < 0:
+            raise ErreurTraitement(
+                "[Stress climatique] Le facteur multiplicatif est negatif ({:.3f}) avec "
+                "stress={} % - verifie la valeur.".format(facteur, pourcentage))
+
+        self.log("=" * 60)
+        self.log("STRESS CLIMATIQUE : x {:.4f}  ({:+.1f} %)".format(facteur, pourcentage))
+        self.log("=" * 60)
+
+        masque_valide = ~self.masque_nodata(matrice, nodata)
+        matrice[masque_valide] *= facteur
+        del masque_valide
+        self.log("  Facteur applique aux pixels valides uniquement (NoData preserve, in-place).")
+        self.log("  Georeferencement inchange (operation purement radiometrique, aucune "
+                 "transform/CRS touche a cette etape).")
+        self.log("")
+        return matrice
+
+    # ------------------------------------------------------------------
+    def appliquer_zero_padding(self, matrice, transform, crs, nodata,
+                               chemin_shp, marge_m, valeur_hors_bassin=0.0):
+        """Force les pixels hors polygone (+ marge) a `valeur_hors_bassin` et
+        comble les NoData internes par interpolation spatiale.
+
+        Renvoie (matrice, masque_interieur) : le masque interieur est
+        necessaire en aval pour calculer la lame de reference du hyetogramme
+        sur le bassin SEUL (sinon les zeros exterieurs, souvent majoritaires,
+        ecrasent la moyenne et le hyetogramme affiche des hauteurs en mm sans
+        rapport avec la pluie reelle sur le bassin)."""
+        from rasterio.features import geometry_mask
+        from rasterio.fill import fillnodata
+        import geopandas as gpd
+
+        self.log("=" * 60)
+        self.log("ZERO-PADDING hors emprise du bassin")
+        self.log("=" * 60)
+
+        if not chemin_shp or not Path(chemin_shp).exists():
+            raise ErreurTraitement("[Shapefile bassin] Fichier introuvable : {}".format(chemin_shp))
+
+        gdf = gpd.read_file(chemin_shp)
+        if gdf.empty:
+            raise ErreurTraitement("Le shapefile {} ne contient aucune geometrie.".format(chemin_shp))
+        if gdf.crs is None:
+            self.log("  ATTENTION : le shapefile n'a AUCUN CRS defini. Ses coordonnees sont "
+                     "supposees deja exprimees dans le CRS du raster ({}). Si ce n'est pas le "
+                     "cas, le masque sera decale - definis la projection du shapefile dans "
+                     "QGIS.".format(crs))
+        elif str(gdf.crs) != str(crs):
+            self.log("  Reprojection du shapefile ({} -> {})".format(gdf.crs, crs))
+            gdf = gdf.to_crs(crs)
+
+        geometrie = gdf.union_all() if hasattr(gdf, "union_all") else gdf.unary_union
+        if marge_m and float(marge_m) != 0.0:
+            geometrie = geometrie.buffer(float(marge_m))
+            self.log("  Marge tampon appliquee : {} m (unites du CRS)".format(marge_m))
+
+        # geometry_mask utilise IMPERATIVEMENT la meme `transform` que celle
+        # lue sur le raster source (parametre recu tel quel, jamais recalcule
+        # a partir des bounds de la geometrie ou d'une resolution supposee) -
+        # c'est ce qui garantit que le masque tombe pixel-pour-pixel au bon
+        # endroit et qu'aucun decalage spatial n'est introduit ici.
+        masque_ext = geometry_mask(
+            geometries=[geometrie], out_shape=matrice.shape, transform=transform, invert=False)
+        del geometrie, gdf
+        gc.collect()
+
+        masque_int = ~masque_ext
+        n_int = int(masque_int.sum())
+        pct_int = 100.0 * n_int / masque_int.size
+        self.log("  Pixels a l'interieur du polygone : {:.2f} % ({} px)".format(pct_int, n_int))
+        if n_int == 0:
+            raise ErreurTraitement(
+                "[Zero-Padding] Le polygone du bassin ne recouvre AUCUN pixel du raster. "
+                "Emprises incompatibles (verifie la projection du shapefile et l'etendue du "
+                "raster) - traitement interrompu.")
+
+        masque_nd = self.masque_nodata(matrice, nodata)
+        nodata_interne = masque_nd & masque_int
+        n_interne = int(nodata_interne.sum())
+
+        if n_interne > 0:
+            self.log("  NoData internes au bassin : {} pixel(s) -> comblement par interpolation".format(n_interne))
+            # CORRECTION : le masque passe a fillnodata definit les pixels
+            # SOURCES (valeur > 0) et les pixels A COMBLER (valeur 0). On
+            # exclut donc TOUS les NoData (internes ET externes) des sources.
+            # L'ancienne version n'excluait que les NoData internes : les
+            # sentinelles exterieures (-9999...) servaient alors de valeurs
+            # d'interpolation et contaminaient les trous proches du bord.
+            # fillnodata n'a ni ne modifie aucune transform/CRS : dimensions,
+            # resolution et origine restent strictement identiques.
+            matrice_travail = matrice.copy()
+            matrice_travail[masque_nd] = 0.0
+            matrice_comblee = fillnodata(
+                matrice_travail, mask=(~masque_nd).astype(np.uint8),
+                max_search_distance=100, smoothing_iterations=0)
+            del matrice, matrice_travail
+            matrice = np.asarray(matrice_comblee, dtype=np.float32)
+            del matrice_comblee
+            gc.collect()
+        else:
+            self.log("  Aucun NoData interne au bassin.")
+        del nodata_interne, masque_nd
+
+        matrice[masque_ext] = valeur_hors_bassin
+        residuel = ~np.isfinite(matrice)
+        n_residuel = int(residuel.sum())
+        if n_residuel:
+            self.log("  {} pixel(s) non finis residuels forces a {}.".format(n_residuel, valeur_hors_bassin))
+            matrice[residuel] = valeur_hors_bassin
+        del residuel
+
+        stats_int = matrice[masque_int]
+        self.log("  Pluie moyenne interieure : {:.4f} mm".format(
+            float(stats_int.mean()) if stats_int.size else float("nan")))
+        self.log("  Pluie min / max interieure : {:.4f} / {:.4f} mm".format(
+            float(stats_int.min()) if stats_int.size else float("nan"),
+            float(stats_int.max()) if stats_int.size else float("nan")))
+        self.log("  Pixels forces a {} mm hors bassin : {}".format(valeur_hors_bassin, int(masque_ext.sum())))
+        self.log("  Georeferencement inchange : meme transform/CRS/dimensions qu'en entree "
+                 "(aucun reechantillonnage, aucune reprojection a cette etape).")
+        self.log("")
+        del masque_ext, stats_int
+        gc.collect()
+        return matrice, masque_int
+
+    # ------------------------------------------------------------------
+    def ecrire_raster(self, chemin, matrice, profil, transform, crs, nodata=None):
+        """Ecrit un raster GeoTIFF en injectant EXPLICITEMENT transform et
+        crs dans le profil (et pas seulement via le profil copie du raster
+        source), en plus de l'affectation post-ouverture dst.transform /
+        dst.crs - double garantie contre tout decalage spatial. Le NoData
+        est egalement force explicitement : si le Zero-Padding a ete
+        applique, `nodata` doit etre None (0.0 est une vraie valeur de pluie,
+        pas une absence de donnee) ; sinon `nodata` reprend la valeur NoData
+        d'origine du raster brut, pour que les pixels manquants restent
+        identifies comme tels en sortie."""
+        import rasterio
+        profil = profil.copy()
+        profil.update(driver="GTiff", dtype="float32", count=1,
+                      nodata=nodata, transform=transform, crs=crs)
+        with rasterio.open(chemin, "w", **profil) as dst:
+            dst.crs = crs
+            dst.transform = transform
+            dst.write(matrice.astype(np.float32), 1)
+
+    # ------------------------------------------------------------------
+    def _verifier_georeferencement_fichier(self, chemin, transform_attendu, crs_attendu):
+        """Verification de tracabilite : rouvre le fichier tout juste ecrit
+        et compare sa transform/CRS effective a celle attendue. Leve une
+        erreur explicite (plutot que de laisser un decalage silencieux) si
+        un ecart est detecte - appelee une seule fois, sur la premiere
+        grille ecrite, pour ne pas alourdir le traitement des suivantes."""
+        import rasterio
+        with rasterio.open(chemin) as verif:
+            transform_lu = verif.transform
+            crs_lu = verif.crs
+        ecart_transform = max(
+            abs(transform_lu.a - transform_attendu.a), abs(transform_lu.b - transform_attendu.b),
+            abs(transform_lu.c - transform_attendu.c), abs(transform_lu.d - transform_attendu.d),
+            abs(transform_lu.e - transform_attendu.e), abs(transform_lu.f - transform_attendu.f))
+        if ecart_transform > 1e-9:
+            raise ErreurTraitement(
+                "[Georeferencement] Decalage spatial detecte sur {} : transform ecrite {} "
+                "!= transform attendue {} (ecart max = {:.3e}). Traitement interrompu avant "
+                "d'ecrire d'autres grilles potentiellement decalees.".format(
+                    Path(chemin).name, transform_lu, transform_attendu, ecart_transform))
+        if str(crs_lu) != str(crs_attendu):
+            raise ErreurTraitement(
+                "[Georeferencement] CRS incoherent sur {} : ecrit '{}' != attendu '{}'.".format(
+                    Path(chemin).name, crs_lu, crs_attendu))
+        self.log("  Controle georeferencement (1ere grille) : transform et CRS strictement "
+                 "identiques a la source - OK, aucun decalage.")
+
+    # ------------------------------------------------------------------
+    def generer_grilles_temporelles(self, matrice_cumul, profil, transform, crs, nodata,
+                                    dossier_sortie, fractions, minutes_cumulees, nom_methode,
+                                    masque_nodata=None):
+        """Ecrit une grille par pas de temps. `masque_nodata` (optionnel) est
+        le masque des pixels sans donnee : ces pixels sont REMIS a la valeur
+        NoData apres multiplication par la fraction. Sans cela, une sentinelle
+        -9999 etait multipliee par la fraction du pas (-9999 x 0.05 = -499.95)
+        et n'etait plus reconnue comme NoData ni par HEC-Vortex ni par QGIS."""
+        self.log("=" * 60)
+        self.log("DISTRIBUTION TEMPORELLE : {}".format(nom_methode))
+        self.log("=" * 60)
+        self.log("  Horodatage des fichiers (fin de pas) a partir du {:%d/%m/%Y %H:%M} "
+                 "(reference conventionnelle pour hyetogramme synthetique, sans lien "
+                 "calendaire reel - necessaire pour que HEC-Vortex reconnaisse "
+                 "Part D/E). Format : pluie_YYYY-MM-DD_HHMM.tif".format(EPOCH_HYETOGRAMME))
+        self.log("")
+
+        dossier_sortie = Path(dossier_sortie)
+        dossier_sortie.mkdir(parents=True, exist_ok=True)
+        n = len(fractions)
+        if minutes_cumulees is None:
+            minutes_cumulees = [60 * (i + 1) for i in range(n)]
+        if len(minutes_cumulees) != n:
+            raise ErreurTraitement(
+                "[Interne] {} fractions mais {} horodatages - incoherence.".format(
+                    n, len(minutes_cumulees)))
+
+        chemins = []
+        somme_verif = np.zeros_like(matrice_cumul)
+
+        self.callback_progression(0.0)
+        for i, fraction in enumerate(fractions, start=1):
+            matrice_pas = matrice_cumul * fraction
+            somme_verif += matrice_pas
+            if masque_nodata is not None and nodata is not None:
+                matrice_pas[masque_nodata] = nodata
+
+            minutes_ecoulees = minutes_cumulees[i - 1]
+            horodatage = EPOCH_HYETOGRAMME + timedelta(minutes=int(minutes_ecoulees))
+            nom_fichier = "pluie_{}.tif".format(horodatage.strftime("%Y-%m-%d_%H%M"))
+            chemin_fichier = dossier_sortie / nom_fichier
+            self.ecrire_raster(chemin_fichier, matrice_pas, profil, transform, crs, nodata)
+            if i == 1:
+                self._verifier_georeferencement_fichier(chemin_fichier, transform, crs)
+            chemins.append(chemin_fichier)
+            self.log("  pas {:>3d}/{}  t={:>6d} min  fraction={:7.4f} %  -> {}".format(
+                i, n, int(minutes_ecoulees), fraction * 100, nom_fichier))
+
+            del matrice_pas
+            if i % 10 == 0:
+                gc.collect()
+            self.callback_progression((i / n) * 100.0)
+
+        # Conservation de masse : evaluee UNIQUEMENT sur les pixels valides
+        # (inclure les sentinelles NoData rendrait le controle absurde).
+        if masque_nodata is not None:
+            valides = ~masque_nodata
+            ecart_max = float(np.abs(somme_verif[valides] - matrice_cumul[valides]).max()) \
+                if valides.any() else 0.0
+        else:
+            ecart_max = float(np.abs(somme_verif - matrice_cumul).max())
+        self.log("")
+        self.log("  Controle de conservation de masse : ecart max = {:.2e} mm".format(ecart_max))
+        if ecart_max > 1e-2:
+            self.log("  ATTENTION : ecart superieur a 0.01 mm - verifier la coherence des fractions.")
+        else:
+            self.log("  OK - conservation de masse verifiee.")
+        self.log("  -> {} grille(s) ecrite(s) dans : {}".format(len(chemins), dossier_sortie))
+        self.log("")
+        del somme_verif
+        gc.collect()
+        return chemins
+
+
+# ============================================================================
+# 3. ORCHESTRATION DU PIPELINE COMPLET
+# ============================================================================
+
+def calculer_table_hyetogramme(fractions, minutes_cumulees, profondeur_totale_mm):
+    """Construit, a partir des fractions temporelles et de la lame totale de
+    reference (mm), le detail EXACT pas-par-pas du hyetogramme : bornes de
+    temps (min), fraction (%), hauteur (mm), intensite (mm/h) et cumul (mm
+    ET adimensionnel P/Ptotale). Aucune valeur n'est arrondie avant
+    l'affichage - le calcul se fait en double precision, l'arrondi
+    n'intervient qu'au moment du formatage texte."""
+    n = len(fractions)
+    if minutes_cumulees is None:
+        minutes_cumulees = [60 * (i + 1) for i in range(n)]
+    debuts = [0] + list(minutes_cumulees[:-1])
+
+    lignes = []
+    cumul_mm = 0.0
+    cumul_frac = 0.0
+    for i in range(n):
+        debut_min = debuts[i]
+        fin_min = minutes_cumulees[i]
+        duree_min = fin_min - debut_min
+        hauteur_mm = fractions[i] * profondeur_totale_mm
+        intensite_mmh = (hauteur_mm / (duree_min / 60.0)) if duree_min > 0 else float("nan")
+        cumul_mm += hauteur_mm
+        cumul_frac += fractions[i]
+        lignes.append({
+            "pas": i + 1,
+            "debut_min": debut_min,
+            "fin_min": fin_min,
+            "duree_min": duree_min,
+            "fraction_pct": fractions[i] * 100.0,
+            "hauteur_mm": hauteur_mm,
+            "intensite_mmh": intensite_mmh,
+            "cumul_mm": cumul_mm,
+            "cumul_adim": cumul_frac,
+        })
+    return lignes
+
+
+def calculer_distribution_temporelle(methode_id, params_methode, log=None):
+    """Aiguillage unique vers la methode de distribution demandee.
+    Renvoie (fractions, minutes_cumulees, nom_methode)."""
+    moteur = MoteurDistributionTemporelle
+    if methode_id in ("I", "IA", "II", "III"):
+        fractions, minutes = moteur.methode_scs_officiel(
+            methode_id, params_methode.get("pas_min"), log=log)
+        nom = "SCS Type {} (NRCS)".format(methode_id)
+    elif methode_id == "B":
+        fractions, minutes = moteur.methode_b_scs_manuel(
+            params_methode.get("texte_manuel", ""), params_methode.get("pas_min", 60.0), log=log)
+        nom = "SCS (saisie manuelle)"
+    elif methode_id == "C":
+        fractions, minutes = moteur.methode_c_blocs_alternes(
+            params_methode.get("a"), params_methode.get("b"),
+            params_methode.get("duree_h"), params_methode.get("pas_min"), log=log)
+        nom = "Methode des blocs alternes (a={}, b={})".format(
+            params_methode.get("a"), params_methode.get("b"))
+    elif methode_id == "D":
+        fractions, minutes = moteur.methode_d_triangulaire(
+            params_methode.get("duree_h"), params_methode.get("r"),
+            params_methode.get("pas_min", 60.0), log=log)
+        nom = "Hyetogramme triangulaire (r={})".format(params_methode.get("r"))
+    elif methode_id == "E":
+        fractions, minutes = moteur.methode_e_historique(
+            params_methode.get("chemin_fichier"), params_methode.get("pas_min", 60.0), log=log)
+        nom = "Pluie historique ({})".format(Path(params_methode.get("chemin_fichier")).name)
+    else:
+        raise ErreurTraitement("Methode de distribution temporelle inconnue : {}".format(methode_id))
+    return fractions, minutes, nom
+
+
+def executer_traitement(chemin_raster, chemin_shp, dossier_sortie,
+                        marge_m, stress_pct, faire_zero_padding,
+                        methode_id, params_methode, log,
+                        callback_progression=None, callback_hyetogramme=None):
+    """Orchestration complete : lecture -> stress -> zero-padding ->
+    distribution temporelle -> ecriture. `log` est appele pour chaque ligne
+    de progression (thread-safe cote appelant). `callback_progression`
+    (optionnel) recoit un pourcentage 0-100. `callback_hyetogramme`
+    (optionnel) recoit un dict decrivant EXACTEMENT le hyetogramme qui va
+    etre ecrit - utilise par la GUI pour tracer les 2 graphiques de controle
+    avant meme que l'ecriture des rasters ne demarre."""
+
+    prepro = PreprocesseurRaster(log, callback_progression=callback_progression)
+
+    if faire_zero_padding and not chemin_shp:
+        raise ErreurTraitement(
+            "Le Zero-Padding est active mais aucun shapefile de bassin n'est selectionne.")
+    if not dossier_sortie:
+        raise ErreurTraitement("Aucun dossier de sortie selectionne.")
+
+    dossier_sortie = Path(dossier_sortie)
+    dossier_sortie.mkdir(parents=True, exist_ok=True)
+    log("Dossier de sortie : {}".format(dossier_sortie))
+    log("")
+
+    # --- 0. Lecture ---
+    matrice, profil, transform, crs, nodata = prepro.lire_raster(chemin_raster)
+    log("")
+
+    # --- 1. Stress climatique ---
+    matrice = prepro.appliquer_stress_climatique(matrice, nodata, stress_pct)
+
+    # --- 2. Zero-padding ---
+    if faire_zero_padding:
+        matrice, masque_reference = prepro.appliquer_zero_padding(
+            matrice, transform, crs, nodata, chemin_shp, marge_m)
+        nodata_final = None
+        masque_nodata_sortie = None
+    else:
+        log("Zero-Padding desactive - raster utilise tel quel (NoData conserve si present).")
+        masque_nd = prepro.masque_nodata(matrice, nodata)
+        if masque_nd.any():
+            nodata_final = nodata if nodata is not None else float("nan")
+            masque_nodata_sortie = masque_nd
+            masque_reference = ~masque_nd
+            log("  {} pixel(s) NoData detecte(s) : ils seront reecrits comme NoData "
+                "(valeur {}) dans CHAQUE grille de sortie.".format(int(masque_nd.sum()), nodata_final))
+        else:
+            nodata_final = nodata
+            masque_nodata_sortie = None
+            masque_reference = None
+        log("")
+
+    # --- 3. Distribution temporelle ---
+    fractions, minutes, nom_methode = calculer_distribution_temporelle(
+        methode_id, params_methode, log=log)
+
+    # Lame de reference : moyenne sur les pixels PERTINENTS uniquement
+    # (interieur du bassin apres zero-padding, ou pixels valides sinon).
+    # Auparavant la moyenne incluait les zeros exterieurs, ce qui divisait la
+    # lame affichee par la proportion de la fenetre occupee par le bassin.
+    if masque_reference is not None and masque_reference.any():
+        pixels_reference = matrice[masque_reference]
+    else:
+        pixels_reference = matrice.ravel()
+    profondeur_totale_mm = float(np.mean(pixels_reference)) if pixels_reference.size else float("nan")
+    # Garde-fou : sans ce controle, une lame NaN (aucun pixel valide) ou nulle
+    # se propagerait a toutes les grilles, qui seraient ecrites sans erreur
+    # mais inexploitables dans HEC-Vortex.
+    if not np.isfinite(profondeur_totale_mm) or profondeur_totale_mm <= 0:
+        raise ErreurTraitement(
+            "Aucune donnee de pluie valide sur la zone etudiee. Verifiez le masque du bassin.")
+    log("Lame de reference du hyetogramme : {:.4f} mm (moyenne sur {} pixel(s) {}).".format(
+        profondeur_totale_mm, int(pixels_reference.size),
+        "interieurs au bassin" if faire_zero_padding else "valides"))
+    log("")
+    del pixels_reference
+
+    duree_totale_min = minutes[-1] if minutes else (len(fractions) * 60)
+
+    if callback_hyetogramme is not None:
+        table_hyeto = calculer_table_hyetogramme(fractions, minutes, profondeur_totale_mm)
+        callback_hyetogramme({
+            "nom_methode": nom_methode,
+            "methode_id": methode_id,
+            "fractions": list(fractions),
+            "minutes_cumulees": list(minutes) if minutes is not None else None,
+            "duree_totale_min": duree_totale_min,
+            "profondeur_totale_mm": profondeur_totale_mm,
+            "table": table_hyeto,
+            "unites": {
+                "temps": "min", "hauteur": "mm", "intensite": "mm/h",
+                "fraction": "%", "cumul": "mm",
+            },
+        })
+
+    chemins = prepro.generer_grilles_temporelles(
+        matrice, profil, transform, crs, nodata_final, dossier_sortie,
+        fractions, minutes, nom_methode, masque_nodata=masque_nodata_sortie)
+
+    log("=" * 60)
+    log("TRAITEMENT TERMINE AVEC SUCCES")
+    log("=" * 60)
+    log("Methode             : {}".format(nom_methode))
+    log("Grilles generees    : {} fichiers".format(len(chemins)))
+    log("Duree totale        : {} min ({:.2f} h)".format(
+        int(duree_totale_min), duree_totale_min / 60.0))
+    log("Dossier complet     : {}".format(dossier_sortie.resolve()))
+
+    return chemins
+
+
+# ============================================================================
+# 4. TRADUCTIONS (Francais / English) - dictionnaire centralise
+# ============================================================================
+# Chaque cle pointe vers {"fr": "...", "en": "..."}. La methode T(cle) de
+# HecVortexPreprocessorApp fait la resolution selon la langue active. Les
+# widgets dont le texte doit changer dynamiquement lors du basculement de
+# langue sont enregistres dans self._registre_textes (voir _txt()).
+# ============================================================================
+
+TRAD = {
+    "titre_app": {"fr": "Pré-processeur HEC-Vortex — Pluie de Projet",
+                  "en": "HEC-Vortex Preprocessor — Design Storm"},
+    "titre_fenetre": {"fr": "HEC-Vortex Preprocessor - Pluie de Projet",
+                      "en": "HEC-Vortex Preprocessor - Design Storm"},
+    "bouton_langue": {"fr": "English", "en": "Français"},
+
+    "cadre_inputs": {"fr": "  Fichiers d'entrée  ", "en": "  Input files  "},
+    "label_raster": {"fr": "Raster brut (.tif) :", "en": "Raw raster (.tif):"},
+    "label_shp": {"fr": "Shapefile du bassin (.shp) :", "en": "Watershed shapefile (.shp):"},
+    "label_dossier_sortie": {"fr": "Dossier de sortie :", "en": "Output folder:"},
+    "bouton_parcourir": {"fr": "Parcourir...", "en": "Browse..."},
+
+    "cadre_params": {"fr": "  Paramètres spatiaux et climatiques  ",
+                     "en": "  Spatial and climate parameters  "},
+    "check_zero_padding": {"fr": "Appliquer le Zero-Padding (forcer à 0.0 hors bassin)",
+                           "en": "Apply Zero-Padding (force to 0.0 outside watershed)"},
+    "label_marge": {"fr": "Marge Tampon (m) :", "en": "Buffer Margin (m):"},
+    "label_stress": {"fr": "Stress Climatique (%) :", "en": "Climate Stress (%):"},
+    "label_stress_note": {"fr": "(raster *= 1 + valeur/100, appliqué avant tout autre traitement)",
+                          "en": "(raster *= 1 + value/100, applied before any other processing)"},
+
+    "cadre_meth": {"fr": "  Moteur de distribution temporelle  ",
+                   "en": "  Temporal distribution engine  "},
+    "label_methode": {"fr": "Méthode :", "en": "Method:"},
+
+    "meth_I": {"fr": "SCS Type I (NRCS)", "en": "SCS Type I (NRCS)"},
+    "meth_IA": {"fr": "SCS Type IA (NRCS)", "en": "SCS Type IA (NRCS)"},
+    "meth_II": {"fr": "SCS Type II (NRCS)", "en": "SCS Type II (NRCS)"},
+    "meth_III": {"fr": "SCS Type III (NRCS)", "en": "SCS Type III (NRCS)"},
+    "meth_B": {"fr": "SCS (Saisie Manuelle)", "en": "SCS (Manual Entry)"},
+    "meth_C": {"fr": "Méthode des Blocs Alternés", "en": "Alternating Block Method"},
+    "meth_D": {"fr": "Hyétogramme Triangulaire", "en": "Triangular Hyetograph"},
+    "meth_E": {"fr": "Pluie Historique (Fichier Observé)", "en": "Historical Storm (Observed File)"},
+
+    "label_pas_temps": {"fr": "Pas de temps (min) :", "en": "Time step (min):"},
+    "note_scs_officiel": {
+        "fr": "Distribution cumulée NRCS/SCS 24 h interpolée de façon monotone (PCHIP si scipy est "
+              "installé, sinon linéaire) au pas de temps choisi. Types IA et II : tables à 0.1 h. "
+              "Types I et III : points de rupture standard de la distribution SCS 24 h. Recoupe ces "
+              "tables avec la source NRCS applicable à ton projet avant un usage réglementaire.",
+        "en": "NRCS/SCS 24-h cumulative distribution, monotonically interpolated (PCHIP if scipy is "
+              "installed, otherwise linear) at the chosen time step. Types IA and II: 0.1 h tables. "
+              "Types I and III: standard breakpoints of the SCS 24-h distribution. Cross-check these "
+              "tables against the NRCS source applicable to your project before regulatory use."},
+
+    "label_manuel_24": {"fr": "24 valeurs séparées par des virgules (somme ≈ 1.0 ou ≈ 100 %) :",
+                        "en": "24 comma-separated values (sum ≈ 1.0 or ≈ 100%):"},
+    "note_manuel": {
+        "fr": "Une valeur par pas de temps, point décimal obligatoire. L'unité (fraction ou %) est "
+              "détectée automatiquement puis renormalisée à 1.0.",
+        "en": "One value per time step, decimal point required. The unit (fraction or %) is detected "
+              "automatically and renormalised to 1.0."},
+
+    "label_param_a": {"fr": "Paramètre a (mm/h, à t=1 min) :", "en": "Parameter a (mm/h, at t=1 min):"},
+    "label_param_b": {"fr": "Paramètre b (sans unité) :", "en": "Parameter b (unitless):"},
+    "label_duree_totale": {"fr": "Durée totale (h) :", "en": "Total duration (h):"},
+    "note_blocs_formule": {
+        "fr": "Convention : I = a . t^-b, avec t en minutes, I en mm/h. Seul b influe sur la forme "
+              "normalisée (a s'annule à la normalisation).",
+        "en": "Convention: I = a . t^-b, with t in minutes, I in mm/h. Only b affects the normalised "
+              "shape (a cancels out during normalisation)."},
+
+    "label_coef_pointe": {"fr": "Coefficient de pointe r (0-1, sans unité) :",
+                          "en": "Peak coefficient r (0-1, unitless):"},
+    "note_triangulaire": {
+        "fr": "Base du triangle = durée totale, sommet à t = r × durée. Intégration exacte de l'aire "
+              "sur chaque pas de temps.",
+        "en": "Triangle base = total duration, apex at t = r × duration. Exact area integration over "
+              "each time step."},
+
+    "label_fichier_hist": {"fr": "Fichier de fractions (.txt / .csv) :",
+                           "en": "Fraction file (.txt / .csv):"},
+    "bouton_charger_fichier": {"fr": "Charger un fichier .txt/.csv", "en": "Load a .txt/.csv file"},
+    "note_historique": {
+        "fr": "Une valeur par ligne (la dernière colonne est lue si la ligne en contient plusieurs). "
+              "Fractions ou pourcentages : la série est renormalisée à 1.0. Le pas de temps ci-dessus "
+              "définit l'intervalle entre deux valeurs.",
+        "en": "One value per line (the last column is read if there are several). Fractions or "
+              "percentages: the series is renormalised to 1.0. The time step above defines the "
+              "interval between two values."},
+
+    "bouton_lancer": {"fr": "▶  Lancer le traitement", "en": "▶  Run processing"},
+    "bouton_lancer_encours": {"fr": "Traitement en cours...", "en": "Processing..."},
+
+    "section_console_graph": {"fr": "Console  /  Hyétogramme exact du dernier traitement",
+                              "en": "Console  /  Exact hyetograph of the last run"},
+
+    "hyeto_resume_vide": {
+        "fr": "Aucun traitement exécuté pour l'instant — lance un traitement pour voir le hyétogramme exact ici.",
+        "en": "No processing run yet — run a job to see the exact hyetograph here."},
+    "hyeto_resume": {
+        "fr": "Méthode : {methode}   |   Lame totale de référence : {lame:.4f} mm  (moyenne du raster "
+              "sur la zone utile)   |   Nombre de pas : {n}   |   Durée : {duree:.2f} h",
+        "en": "Method: {methode}   |   Reference total depth: {lame:.4f} mm  (mean of the raster over "
+              "the useful area)   |   Number of steps: {n}   |   Duration: {duree:.2f} h"},
+
+    "titre_graph_vide": {"fr": "Aucun hyétogramme calculé pour l'instant", "en": "No hyetograph computed yet"},
+    "titre_graph1": {"fr": "Hyétogramme — {methode}", "en": "Hyetograph — {methode}"},
+    "titre_graph2": {"fr": "Comparateur adimensionnel — courbes SCS standard",
+                     "en": "Dimensionless comparator — standard SCS curves"},
+    "xlabel_temps_min": {"fr": "Temps (min)", "en": "Time (min)"},
+    "ylabel_hauteur_pas": {"fr": "Hauteur / pas (mm)", "en": "Depth / step (mm)"},
+    "ylabel_cumul_adim": {"fr": "Cumul adimensionnel P/Ptotale", "en": "Dimensionless cumulative P/Ptotal"},
+    "legende_cumul_adim": {"fr": "Cumul adimensionnel (0 → 1)", "en": "Dimensionless cumulative (0 → 1)"},
+    "xlabel_t_sur_t24": {"fr": "t / durée totale de l'épisode", "en": "t / total event duration"},
+    "ylabel_p_sur_p24": {"fr": "P cumulée / P totale", "en": "Cumulative P / Total P"},
+    "legende_methode_actuelle": {"fr": "Méthode calculée", "en": "Computed method"},
+    "annot_pic": {"fr": "pic : {valeur:.3f} mm", "en": "peak: {valeur:.3f} mm"},
+
+    "table_hint": {"fr": "Table exacte (clic sur une ligne = surligne le bloc correspondant) :",
+                   "en": "Exact table (click a row to highlight the matching block):"},
+    "col_pas": {"fr": "N°", "en": "No."},
+    "col_debut": {"fr": "Début (min)", "en": "Start (min)"},
+    "col_fin": {"fr": "Fin (min)", "en": "End (min)"},
+    "col_duree": {"fr": "Durée (min)", "en": "Duration (min)"},
+    "col_fraction": {"fr": "Fraction (%)", "en": "Fraction (%)"},
+    "col_hauteur": {"fr": "Hauteur (mm)", "en": "Depth (mm)"},
+    "col_intensite": {"fr": "Intensité (mm/h)", "en": "Intensity (mm/h)"},
+    "col_cumul": {"fr": "Cumul (mm)", "en": "Cumulative (mm)"},
+    "unites_note": {
+        "fr": "Unités : temps en minutes, hauteur et cumul en mm, intensité en mm/h, fraction en %.",
+        "en": "Units: time in minutes, depth and cumulative in mm, intensity in mm/h, fraction in %."},
+
+    "signature": {"fr": "par mohamed ikbal el agadi", "en": "by mohamed ikbal el agadi"},
+
+    "dlg_raster": {"fr": "Sélectionner le raster brut", "en": "Select the raw raster"},
+    "dlg_shp": {"fr": "Sélectionner le shapefile du bassin", "en": "Select the watershed shapefile"},
+    "dlg_dossier": {"fr": "Choisir le dossier de sauvegarde des rasters générés",
+                    "en": "Choose the folder to save generated rasters"},
+    "dlg_hist": {"fr": "Charger un fichier de pluie historique", "en": "Load a historical storm file"},
+    "dlg_tous_fichiers": {"fr": "Tous les fichiers", "en": "All files"},
+
+    "err_fichier_manquant_titre": {"fr": "Fichier manquant", "en": "Missing file"},
+    "err_raster_manquant": {"fr": "Sélectionne d'abord le raster brut (.tif).",
+                            "en": "Select the raw raster (.tif) first."},
+    "err_shp_manquant": {"fr": "Le Zero-Padding nécessite un shapefile de bassin — sélectionne-le, ou décoche l'option.",
+                         "en": "Zero-Padding requires a watershed shapefile — select it, or uncheck the option."},
+    "err_dossier_manquant_titre": {"fr": "Dossier manquant", "en": "Missing folder"},
+    "err_dossier_manquant": {"fr": "Choisis un dossier de sortie.", "en": "Choose an output folder."},
+    "err_param_invalide_titre": {"fr": "Paramètre invalide", "en": "Invalid parameter"},
+    "info_traitement_encours_titre": {"fr": "Traitement en cours", "en": "Processing in progress"},
+    "info_traitement_encours": {"fr": "Un traitement est déjà en cours d'exécution.",
+                                "en": "A job is already running."},
+    "succes_titre": {"fr": "Succès", "en": "Success"},
+    "succes_msg": {"fr": "Le traitement s'est terminé avec succès.\n\nRésultats dans :\n{dossier}",
+                   "en": "Processing completed successfully.\n\nResults in:\n{dossier}"},
+    "log_succes": {"fr": "Traitement terminé avec succès.", "en": "Processing completed successfully."},
+    "erreur_traitement_titre": {"fr": "Erreur de traitement", "en": "Processing error"},
+    "erreur_inattendue_titre": {"fr": "Erreur inattendue", "en": "Unexpected error"},
+    "erreur_inattendue_msg": {"fr": "{message}\n\nDétail dans la console de log.",
+                              "en": "{message}\n\nDetails in the log console."},
+}
+
+
+# ============================================================================
+# 5. INTERFACE GRAPHIQUE (Frontend) - tkinter / ttk
+# ============================================================================
+
+class HecVortexPreprocessorApp:
+    # ========================================================================
+    # PALETTE "CRISP CORPORATE" - cartes blanches sur fond gris-bleu tres
+    # doux, accent bleu confiant, hierarchie de gris neutres (inspiree des
+    # suites d'ingenierie modernes type Bentley/Autodesk et des interfaces
+    # SaaS professionnelles). Design choisi VOLONTAIREMENT clair plutot que
+    # "Dark Slate" : la NavigationToolbar2Tk de matplotlib est un widget Tk
+    # natif non-ttk (elle ignore totalement ttk.Style) et resterait grise
+    # quel que soit le theme choisi - sur un chrome sombre, cette barre
+    # d'outils non themable creerait une zone grise flottante et cassee au
+    # milieu de l'interface. Un chrome clair et raffine reste invisible a
+    # cote d'elle tout en restant tres haut de gamme.
+    #
+    # Les noms d'attributs sont conserves a l'identique de la version
+    # precedente (ils sont lus tels quels par _afficher_hyetogramme,
+    # _dessiner_hyetogramme_vide et _on_select_ligne_hyeto, intouches) :
+    # seules les valeurs hexadecimales ont ete raffinees, et de nouveaux
+    # attributs ont ete ajoutes pour la nouvelle hierarchie visuelle.
+    # ========================================================================
+    FAMILLE = "Segoe UI"
+    FAMILLE_MONO = "Cascadia Mono"
+
+    # -- Neutres et fonds -----------------------------------------------
+    COULEUR_FOND = "#EEF1F6"            # fond de page : gris-bleu tres doux
+    COULEUR_CADRE = "#FFFFFF"           # fond des cartes (LabelFrame, etc.)
+    COULEUR_BORDURE = "#E4E8EF"         # liseres discrets (cartes, Treeview)
+    COULEUR_BORDURE_FORTE = "#CBD3E0"   # bordures d'Entry/Combobox, separateurs
+    COULEUR_TEXTE = "#1D2939"           # texte principal (gris-anthracite)
+    COULEUR_TEXTE_DISCRET = "#66708A"   # texte secondaire / notes
+    COULEUR_SIGNATURE = "#9AA4B8"       # mentions tres discretes
+
+    # -- Identite / hierarchie ------------------------------------------
+    COULEUR_TITRE = "#101828"           # quasi-noir navy : aussi utilise par
+                                        # matplotlib (titres, courbe methode) -
+                                        # reste tres lisible sur fond blanc.
+    COULEUR_SECTION = "#33475B"         # intitules de section (cartes)
+
+    # -- Accent (bleu corporate) ------------------------------------------
+    COULEUR_ACCENT = "#2F6FED"
+    COULEUR_ACCENT_SURVOL = "#1E54C6"
+    COULEUR_ACCENT_ACTIF = "#173F99"
+    COULEUR_ACCENT_LEGER = "#E9F0FE"    # teinte tres claire (survol ghost/hover)
+
+    # -- Etats -------------------------------------------------------------
+    COULEUR_DESACTIVE_FOND = "#DCE1EA"
+    COULEUR_DESACTIVE_TEXTE = "#9AA4B8"
+
+    # -- Console de log (theme sombre delibere, style IDE) ------------------
+    COULEUR_CONSOLE_FOND = "#11182A"
+    COULEUR_CONSOLE_TEXTE = "#E4E8F1"
+    COULEUR_CONSOLE_ERREUR = "#F87171"
+    COULEUR_CONSOLE_SUCCES = "#4ADE80"
+
+    # Palette dediee au panneau hyetogramme (bleu = pluie/barres, rouge =
+    # bloc pic mis en evidence / ligne selectionnee). COULEUR_HYETO_CUMUL est
+    # volontairement distincte des 4 couleurs SCS pour qu'on ne confonde pas
+    # la courbe cumulee du graphique 1 avec une courbe SCS de reference.
+    # (Inchangees : ces couleurs pilotent matplotlib, valide et intouche.)
+    COULEUR_HYETO_BARRE = "#2E75B6"
+    COULEUR_HYETO_BARRE_SELECTION = "#C0392B"
+    COULEUR_HYETO_BARRE_PIC = "#E8A33D"
+    COULEUR_HYETO_CUMUL = "#1B4F72"
+
+    # Couleurs des 4 courbes SCS standard dans le comparateur adimensionnel
+    # (Inchangees, pilotent matplotlib.)
+    COULEURS_SCS = {"I": "#8E44AD", "IA": "#27AE60", "II": "#C0392B", "III": "#D68910"}
+
+    def __init__(self, root):
+        self.root = root
+        # `_langue_code` est un miroir Python PUR de la langue active.
+        # T() le lit a la place de la tk.StringVar : une StringVar ne peut
+        # pas etre interrogee depuis un thread secondaire (RuntimeError
+        # "main thread is not in main loop"), or le thread de traitement
+        # appelle T() pour composer ses messages.
+        self._langue_code = "fr"
+        self.langue = tk.StringVar(value="fr")
+        self._registre_textes = []   # [(widget, cle, sous_element_ou_None), ...]
+
+        self.root.title(self.T("titre_fenetre"))
+        self.root.geometry("1440x900")
+        self.root.minsize(1100, 700)
+        self.root.configure(bg=self.COULEUR_FOND)
+
+        self.log_queue = queue.Queue()
+        self.traitement_en_cours = False
+        self.dernier_hyetogramme = None   # dernier dict recu via callback_hyetogramme
+        self._hyeto_barres = None         # patches matplotlib (selection interactive)
+        self.canvas_hyeto = None
+
+        self._construire_style()
+        self._construire_interface()
+        self._poll_log_queue()
+        self.root.protocol("WM_DELETE_WINDOW", self._fermer)
+
+    # ------------------------------------------------------------------
+    # TRADUCTION - T(cle) resout selon la langue active ; _txt() applique le
+    # texte ET enregistre le widget pour re-traduction lors du basculement.
+    # ------------------------------------------------------------------
+    def T(self, cle, **kwargs):
+        entree = TRAD.get(cle)
+        if entree is None:
+            return cle
+        texte = entree.get(self._langue_code, entree.get("fr", cle))
+        if kwargs:
+            try:
+                texte = texte.format(**kwargs)
+            except (KeyError, IndexError, ValueError):
+                pass
+        return texte
+
+    def _txt(self, widget, cle, heading_col=None):
+        """Definit le texte initial d'un widget a partir de sa cle de
+        traduction ET enregistre (widget, cle, heading_col) pour que
+        _rafraichir_langue() puisse le remettre a jour plus tard."""
+        if heading_col is not None:
+            widget.heading(heading_col, text=self.T(cle))
+        else:
+            widget.configure(text=self.T(cle))
+        self._registre_textes.append((widget, cle, heading_col))
+
+    def _basculer_langue(self):
+        self._langue_code = "en" if self._langue_code == "fr" else "fr"
+        self.langue.set(self._langue_code)
+        self._rafraichir_langue()
+
+    def _rafraichir_langue(self):
+        self._langue_code = self.langue.get() or "fr"
+        self.root.title(self.T("titre_fenetre"))
+        for widget, cle, heading_col in self._registre_textes:
+            try:
+                if heading_col is not None:
+                    widget.heading(heading_col, text=self.T(cle))
+                else:
+                    widget.configure(text=self.T(cle))
+            except tk.TclError:
+                pass  # widget detruit entre-temps - ignorer
+        self.bouton_langue.configure(text=self.T("bouton_langue"))
+        if not self.traitement_en_cours:
+            self.bouton_lancer.configure(text=self.T("bouton_lancer"))
+        # Combobox des methodes : reconstruire la liste de valeurs traduites
+        # tout en conservant la selection courante (par identifiant, pas par
+        # libelle, puisque le libelle change de langue).
+        methode_id_selection = getattr(self, "_methode_id_courante", self.methodes[0][0])
+        self.combo_methode["values"] = [self.T(cle) for _, cle in self.methodes]
+        for mid, cle in self.methodes:
+            if mid == methode_id_selection:
+                self.var_methode.set(self.T(cle))
+                break
+        if self.dernier_hyetogramme is None:
+            self.var_hyeto_resume.set(self.T("hyeto_resume_vide"))
+            self._dessiner_hyetogramme_vide()
+        else:
+            self._afficher_hyetogramme(self.dernier_hyetogramme)
+
+    # ------------------------------------------------------------------
+    def _construire_style(self):
+        """Configuration ttk complete. Theme de base 'clam' (seul theme ttk
+        stock offrant un rendu plat sans relief 3D des annees 90), entierement
+        recouvert par la palette et la typographie 'Crisp Corporate' :
+        cartes blanches a liseres fins, boutons a hierarchie primaire/
+        secondaire, champs de saisie a anneau de focus colore, tableau et
+        barre de progression fins et plats."""
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        F = self.FAMILLE
+
+        # -- Base : tout ce qui vit directement sur la page (fond app) ----
+        style.configure(".", background=self.COULEUR_FOND, foreground=self.COULEUR_TEXTE,
+                        font=(F, 10))
+        style.configure("TFrame", background=self.COULEUR_FOND)
+        style.configure("TLabel", background=self.COULEUR_FOND, foreground=self.COULEUR_TEXTE)
+        style.configure("TCheckbutton", background=self.COULEUR_FOND, foreground=self.COULEUR_TEXTE,
+                        font=(F, 10))
+        style.configure("TPanedwindow", background=self.COULEUR_FOND)
+
+        # -- Cartes : tout ce qui vit a l'INTERIEUR d'une section blanche --
+        # (LabelFrame "Carte.TLabelframe" + variantes de widgets enfants
+        # dont le fond doit correspondre au blanc de la carte plutot qu'au
+        # gris de la page - sans cela, chaque label/checkbutton/frame
+        # imbrique laisserait apparaitre une legere marque rectangulaire de
+        # la couleur de la page derriere lui.)
+        style.configure("Carte.TLabelframe", background=self.COULEUR_CADRE,
+                        bordercolor=self.COULEUR_BORDURE, relief="solid", borderwidth=1)
+        style.configure("Carte.TLabelframe.Label", background=self.COULEUR_CADRE,
+                        foreground=self.COULEUR_SECTION, font=(F, 10, "bold"))
+        style.configure("Carte.TFrame", background=self.COULEUR_CADRE)
+        style.configure("Carte.TLabel", background=self.COULEUR_CADRE, foreground=self.COULEUR_TEXTE,
+                        font=(F, 10))
+        style.configure("Carte.TCheckbutton", background=self.COULEUR_CADRE,
+                        foreground=self.COULEUR_TEXTE, font=(F, 10))
+
+        # -- Hierarchie typographique --------------------------------------
+        style.configure("Titre.TLabel", font=(F, 19, "bold"),
+                        foreground=self.COULEUR_TITRE, background=self.COULEUR_FOND)
+        style.configure("Section.TLabel", font=(F, 10, "bold"),
+                        foreground=self.COULEUR_SECTION, background=self.COULEUR_FOND)
+        style.configure("Discret.TLabel", font=(F, 9),
+                        foreground=self.COULEUR_TEXTE_DISCRET, background=self.COULEUR_FOND)
+        style.configure("DiscretCarte.TLabel", font=(F, 9),
+                        foreground=self.COULEUR_TEXTE_DISCRET, background=self.COULEUR_CADRE)
+        style.configure("Signature.TLabel", font=(F, 8, "italic"),
+                        foreground=self.COULEUR_SIGNATURE, background=self.COULEUR_FOND)
+
+        # -- Separateurs (filets de respiration entre sections) -----------
+        style.configure("TSeparator", background=self.COULEUR_BORDURE_FORTE)
+        style.configure("Accent.TSeparator", background=self.COULEUR_ACCENT)
+
+        # -- Bouton PRIMAIRE (une seule action forte a l'ecran) ------------
+        style.configure("Lancer.TButton", font=(F, 12, "bold"),
+                        foreground="#ffffff", background=self.COULEUR_ACCENT,
+                        borderwidth=0, focusthickness=0, padding=(16, 14))
+        style.map("Lancer.TButton",
+                  background=[("disabled", self.COULEUR_DESACTIVE_FOND),
+                              ("pressed", self.COULEUR_ACCENT_ACTIF),
+                              ("active", self.COULEUR_ACCENT_SURVOL)],
+                  foreground=[("disabled", self.COULEUR_DESACTIVE_TEXTE)])
+
+        # -- Bouton SECONDAIRE ("Parcourir...", "Charger un fichier...") --
+        # Style "ghost" (fond blanc, liseret fin, texte accent) : distinct du
+        # bouton primaire, pour que l'oeil comprenne immediatement qu'il n'y
+        # a qu'une seule action de lancement possible sur tout l'ecran.
+        style.configure("Secondaire.TButton", font=(F, 9),
+                        foreground=self.COULEUR_ACCENT, background=self.COULEUR_CADRE,
+                        bordercolor=self.COULEUR_BORDURE_FORTE, borderwidth=1,
+                        relief="solid", focusthickness=0, padding=(12, 7))
+        style.map("Secondaire.TButton",
+                  background=[("pressed", self.COULEUR_ACCENT_LEGER),
+                              ("active", self.COULEUR_ACCENT_LEGER)],
+                  bordercolor=[("active", self.COULEUR_ACCENT), ("focus", self.COULEUR_ACCENT)],
+                  foreground=[("disabled", self.COULEUR_DESACTIVE_TEXTE)])
+
+        # -- Bouton de bascule de langue (ghost minimaliste, coin superieur) --
+        style.configure("Langue.TButton", font=(F, 9),
+                        foreground=self.COULEUR_SECTION, background=self.COULEUR_FOND,
+                        bordercolor=self.COULEUR_BORDURE_FORTE, borderwidth=1,
+                        relief="solid", focusthickness=0, padding=(12, 6))
+        style.map("Langue.TButton",
+                  background=[("active", self.COULEUR_CADRE)],
+                  bordercolor=[("active", self.COULEUR_ACCENT)])
+
+        style.configure("TButton", padding=(10, 6), font=(F, 9))
+
+        # -- Champs de saisie : bordure fine, anneau de focus colore -------
+        for nom_style in ("TEntry", "TSpinbox", "TCombobox"):
+            style.configure(nom_style, fieldbackground="#FFFFFF", foreground=self.COULEUR_TEXTE,
+                            bordercolor=self.COULEUR_BORDURE_FORTE, lightcolor=self.COULEUR_BORDURE_FORTE,
+                            darkcolor=self.COULEUR_BORDURE_FORTE, borderwidth=1, relief="flat",
+                            padding=6, arrowcolor=self.COULEUR_TEXTE_DISCRET)
+            style.map(nom_style,
+                      bordercolor=[("focus", self.COULEUR_ACCENT)],
+                      lightcolor=[("focus", self.COULEUR_ACCENT)],
+                      darkcolor=[("focus", self.COULEUR_ACCENT)],
+                      fieldbackground=[("readonly", "#FFFFFF"), ("disabled", self.COULEUR_DESACTIVE_FOND)])
+        # Liste deroulante du Combobox (Listbox Tk pur, hors ttk.Style)
+        self.root.option_add("*TCombobox*Listbox.background", "#FFFFFF")
+        self.root.option_add("*TCombobox*Listbox.foreground", self.COULEUR_TEXTE)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", self.COULEUR_ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#FFFFFF")
+        self.root.option_add("*TCombobox*Listbox.font", (F, 10))
+
+        # -- Cases a cocher : pastille pleine a l'etat coche ----------------
+        for nom_style in ("TCheckbutton", "Carte.TCheckbutton"):
+            style.map(nom_style,
+                      indicatorcolor=[("selected", self.COULEUR_ACCENT), ("!selected", "#FFFFFF")],
+                      indicatorbackground=[("selected", self.COULEUR_ACCENT), ("!selected", "#FFFFFF")])
+
+        # -- Barre de progression : fine et plate --------------------------
+        style.configure("TProgressbar", background=self.COULEUR_ACCENT,
+                        troughcolor=self.COULEUR_BORDURE, borderwidth=0, thickness=7,
+                        lightcolor=self.COULEUR_ACCENT, darkcolor=self.COULEUR_ACCENT)
+
+        # -- Table du hyetogramme (Treeview - widget cree dans la methode
+        #    intouchee _construire_panneau_hyetogramme, mais son style ttk
+        #    global est configure ici sans toucher a sa logique) -----------
+        style.configure("Treeview", background=self.COULEUR_CADRE, fieldbackground=self.COULEUR_CADRE,
+                        foreground=self.COULEUR_TEXTE, bordercolor=self.COULEUR_BORDURE,
+                        borderwidth=1, relief="flat", rowheight=24, font=(F, 9))
+        style.configure("Treeview.Heading", background=self.COULEUR_FOND, foreground=self.COULEUR_SECTION,
+                        font=(F, 9, "bold"), relief="flat", borderwidth=1)
+        style.map("Treeview.Heading", background=[("active", self.COULEUR_BORDURE_FORTE)])
+        style.map("Treeview", background=[("selected", self.COULEUR_ACCENT_LEGER)],
+                  foreground=[("selected", self.COULEUR_TITRE)])
+
+        # -- Ascenseurs : fins et plats -------------------------------------
+        style.configure("TScrollbar", background=self.COULEUR_BORDURE_FORTE, troughcolor=self.COULEUR_FOND,
+                        bordercolor=self.COULEUR_FOND, arrowcolor=self.COULEUR_TEXTE_DISCRET,
+                        relief="flat", borderwidth=0, arrowsize=12)
+        style.map("TScrollbar", background=[("active", self.COULEUR_ACCENT)])
+
+    # ------------------------------------------------------------------
+    def _construire_interface(self):
+        canvas = tk.Canvas(self.root, highlightthickness=0, bg=self.COULEUR_FOND)
+        scrollbar_v = ttk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
+        # padding genereux (24) : l'ensemble de l'interface "respire" au lieu
+        # de coller aux bords de la fenetre.
+        conteneur = ttk.Frame(canvas, padding=(28, 24))
+
+        conteneur.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        id_fenetre_conteneur = canvas.create_window((0, 0), window=conteneur, anchor="nw")
+
+        # canvas.create_window() ne redimensionne JAMAIS le widget qu'il
+        # contient : sans la synchronisation ci-dessous, `conteneur` garderait
+        # sa largeur naturelle et laisserait une bande grise vide a droite.
+        def _synchroniser_largeur_conteneur(event):
+            # <Configure> se declenche aussi pour les widgets internes a
+            # `conteneur` ; on ne synchronise donc QUE sur l'evenement du
+            # canvas lui-meme, sinon la largeur retomberait a celle d'un
+            # widget interne (quelques centaines de pixels).
+            if event.widget is canvas:
+                canvas.itemconfig(id_fenetre_conteneur, width=event.width)
+        canvas.bind("<Configure>", _synchroniser_largeur_conteneur)
+        canvas.configure(yscrollcommand=scrollbar_v.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar_v.pack(side="right", fill="y")
+
+        def _on_mousewheel(event):
+            if event.num == 4:
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                canvas.yview_scroll(1, "units")
+            else:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", _on_mousewheel)   # molette sous X11/Linux
+        canvas.bind_all("<Button-5>", _on_mousewheel)
+        self._canvas_principal = canvas
+
+        # ---- Titre + bascule de langue ----
+        cadre_titre = ttk.Frame(conteneur)
+        cadre_titre.pack(fill=tk.X, pady=(0, 6))
+        self.label_titre = ttk.Label(cadre_titre, style="Titre.TLabel")
+        self._txt(self.label_titre, "titre_app")
+        self.label_titre.pack(side=tk.LEFT, anchor="w")
+        self.bouton_langue = ttk.Button(cadre_titre, style="Langue.TButton",
+                                        text=self.T("bouton_langue"), command=self._basculer_langue)
+        self.bouton_langue.pack(side=tk.RIGHT, anchor="e")
+
+        # Filet fin sous l'entete : separe le titre du contenu, comme une
+        # sous-barre de navigation dans un outil professionnel.
+        ttk.Separator(conteneur, orient="horizontal").pack(fill=tk.X, pady=(0, 20))
+
+        # ---- Fichiers d'entree ----
+        self.cadre_inputs = ttk.LabelFrame(conteneur, style="Carte.TLabelframe", padding=(20, 16))
+        self._txt(self.cadre_inputs, "cadre_inputs")
+        self.cadre_inputs.pack(fill=tk.X, pady=(0, 16))
+        self.cadre_inputs.columnconfigure(1, weight=1)
+
+        self.label_raster = ttk.Label(self.cadre_inputs, style="Carte.TLabel")
+        self._txt(self.label_raster, "label_raster")
+        self.label_raster.grid(row=0, column=0, sticky="w", pady=6)
+        self.var_raster = tk.StringVar()
+        ttk.Entry(self.cadre_inputs, textvariable=self.var_raster, state="readonly").grid(
+            row=0, column=1, sticky="ew", padx=10, pady=6)
+        b1 = ttk.Button(self.cadre_inputs, style="Secondaire.TButton", command=self._choisir_raster)
+        self._txt(b1, "bouton_parcourir")
+        b1.grid(row=0, column=2, pady=6)
+
+        self.label_shp = ttk.Label(self.cadre_inputs, style="Carte.TLabel")
+        self._txt(self.label_shp, "label_shp")
+        self.label_shp.grid(row=1, column=0, sticky="w", pady=6)
+        self.var_shp = tk.StringVar()
+        ttk.Entry(self.cadre_inputs, textvariable=self.var_shp, state="readonly").grid(
+            row=1, column=1, sticky="ew", padx=10, pady=6)
+        b2 = ttk.Button(self.cadre_inputs, style="Secondaire.TButton", command=self._choisir_shapefile)
+        self._txt(b2, "bouton_parcourir")
+        b2.grid(row=1, column=2, pady=6)
+
+        self.label_dossier_sortie = ttk.Label(self.cadre_inputs, style="Carte.TLabel")
+        self._txt(self.label_dossier_sortie, "label_dossier_sortie")
+        self.label_dossier_sortie.grid(row=2, column=0, sticky="w", pady=6)
+        self.var_dossier_sortie = tk.StringVar()
+        ttk.Entry(self.cadre_inputs, textvariable=self.var_dossier_sortie, state="readonly").grid(
+            row=2, column=1, sticky="ew", padx=10, pady=6)
+        b3 = ttk.Button(self.cadre_inputs, style="Secondaire.TButton", command=self._choisir_dossier_sortie)
+        self._txt(b3, "bouton_parcourir")
+        b3.grid(row=2, column=2, pady=6)
+
+        # ---- Parametres spatiaux / climat ----
+        self.cadre_params = ttk.LabelFrame(conteneur, style="Carte.TLabelframe", padding=(20, 16))
+        self._txt(self.cadre_params, "cadre_params")
+        self.cadre_params.pack(fill=tk.X, pady=(0, 16))
+
+        self.var_zero_padding = tk.BooleanVar(value=True)
+        check_zp = ttk.Checkbutton(self.cadre_params, style="Carte.TCheckbutton",
+                                   variable=self.var_zero_padding)
+        self._txt(check_zp, "check_zero_padding")
+        check_zp.grid(row=0, column=0, columnspan=3, sticky="w", pady=6)
+
+        self.label_marge = ttk.Label(self.cadre_params, style="Carte.TLabel")
+        self._txt(self.label_marge, "label_marge")
+        self.label_marge.grid(row=1, column=0, sticky="w", pady=6)
+        self.var_marge = tk.StringVar(value="400.0")
+        ttk.Spinbox(self.cadre_params, from_=0.0, to=100000.0, increment=50.0,
+                    textvariable=self.var_marge, width=12).grid(row=1, column=1, sticky="w", padx=12)
+
+        self.label_stress = ttk.Label(self.cadre_params, style="Carte.TLabel")
+        self._txt(self.label_stress, "label_stress")
+        self.label_stress.grid(row=2, column=0, sticky="w", pady=6)
+        self.var_stress = tk.StringVar(value="0.0")
+        ttk.Spinbox(self.cadre_params, from_=-100.0, to=1000.0, increment=5.0,
+                    textvariable=self.var_stress, width=12).grid(row=2, column=1, sticky="w", padx=12)
+        self.label_stress_note = ttk.Label(self.cadre_params, style="DiscretCarte.TLabel")
+        self._txt(self.label_stress_note, "label_stress_note")
+        self.label_stress_note.grid(row=2, column=2, sticky="w", padx=(10, 0))
+
+        # ---- Distribution temporelle ----
+        self.cadre_meth = ttk.LabelFrame(conteneur, style="Carte.TLabelframe", padding=(20, 16))
+        self._txt(self.cadre_meth, "cadre_meth")
+        self.cadre_meth.pack(fill=tk.X, pady=(0, 16))
+        self.cadre_meth.columnconfigure(1, weight=1)
+
+        self.label_methode = ttk.Label(self.cadre_meth, style="Carte.TLabel")
+        self._txt(self.label_methode, "label_methode")
+        self.label_methode.grid(row=0, column=0, sticky="w")
+
+        self.methodes = [
+            ("I", "meth_I"), ("IA", "meth_IA"), ("II", "meth_II"), ("III", "meth_III"),
+            ("B", "meth_B"), ("C", "meth_C"), ("D", "meth_D"), ("E", "meth_E"),
+        ]
+        self.var_methode = tk.StringVar(value=self.T(self.methodes[0][1]))
+        self.combo_methode = ttk.Combobox(self.cadre_meth, textvariable=self.var_methode,
+                                          state="readonly",
+                                          values=[self.T(cle) for _, cle in self.methodes], width=42)
+        self.combo_methode.grid(row=0, column=1, sticky="w", padx=10, pady=(0, 10))
+        self.combo_methode.bind("<<ComboboxSelected>>", lambda e: self._afficher_cadre_methode())
+
+        self.cadre_methode_params = ttk.Frame(self.cadre_meth, style="Carte.TFrame")
+        self.cadre_methode_params.grid(row=1, column=0, columnspan=2, sticky="ew")
+
+        self._construire_cadres_methodes()
+        self._afficher_cadre_methode()
+
+        # ---- Bouton d'execution ----
+        self.bouton_lancer = ttk.Button(conteneur, style="Lancer.TButton", command=self._lancer_traitement)
+        self._txt(self.bouton_lancer, "bouton_lancer")
+        self.bouton_lancer.pack(fill=tk.X, pady=(4, 14))
+
+        self.barre_progression = ttk.Progressbar(conteneur, style="TProgressbar", mode="determinate",
+                                                 maximum=100.0, value=0.0)
+        self.barre_progression.pack(fill=tk.X, pady=(0, 4))
+        self.var_pct_label = tk.StringVar(value="")
+        ttk.Label(conteneur, textvariable=self.var_pct_label, style="Discret.TLabel").pack(
+            anchor="e", pady=(0, 16))
+
+        # ---- Console (gauche) + Hyetogramme exact (droite) ----
+        self.label_section_console = ttk.Label(conteneur, style="Section.TLabel")
+        self._txt(self.label_section_console, "section_console_graph")
+        self.label_section_console.pack(anchor="w", pady=(0, 8))
+
+        panneau_bas = ttk.PanedWindow(conteneur, orient=tk.HORIZONTAL)
+        panneau_bas.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        # -- Volet gauche : console, presentee comme une carte sombre style
+        #    IDE (contraste volontaire avec le reste de l'interface, tres
+        #    lisible et immediatement identifiable comme une zone technique) --
+        cadre_log = tk.Frame(panneau_bas, bg=self.COULEUR_CONSOLE_FOND, highlightthickness=1,
+                             highlightbackground=self.COULEUR_BORDURE_FORTE)
+        scrollbar_log = ttk.Scrollbar(cadre_log)
+        scrollbar_log.pack(side=tk.RIGHT, fill=tk.Y)
+        self.zone_log = tk.Text(cadre_log, height=24, width=52, bg=self.COULEUR_CONSOLE_FOND,
+                                fg=self.COULEUR_CONSOLE_TEXTE, insertbackground=self.COULEUR_CONSOLE_TEXTE,
+                                relief="flat", borderwidth=0, padx=14, pady=12,
+                                font=(self.FAMILLE_MONO, 10), yscrollcommand=scrollbar_log.set,
+                                state="disabled")
+        self.zone_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar_log.config(command=self.zone_log.yview)
+        self.zone_log.tag_configure("erreur", foreground=self.COULEUR_CONSOLE_ERREUR)
+        self.zone_log.tag_configure("succes", foreground=self.COULEUR_CONSOLE_SUCCES)
+        panneau_bas.add(cadre_log, weight=1)
+
+        # -- Volet droit : 2 graphiques + table exacte du hyetogramme.
+        #    Seul le style (fond blanc "carte") est applique ici ; AUCUN
+        #    padding supplementaire n'est ajoute autour de ce conteneur,
+        #    pour ne pas rogner la largeur deja tres sollicitee du canevas
+        #    matplotlib (Figure 13.0x5.2 po, definie et validee dans la
+        #    methode intouchee _construire_panneau_hyetogramme).
+        cadre_hyeto = ttk.Frame(panneau_bas, style="Carte.TFrame")
+        self._construire_panneau_hyetogramme(cadre_hyeto)
+        panneau_bas.add(cadre_hyeto, weight=5)
+
+        # ---- Signature du concepteur (discrete, en bas a droite) ----
+        self.label_signature = ttk.Label(conteneur, style="Signature.TLabel")
+        self._txt(self.label_signature, "signature")
+        self.label_signature.pack(anchor="e", pady=(10, 0))
+
+    # ------------------------------------------------------------------
+    def _construire_cadres_methodes(self):
+        """Pre-construit un sous-cadre de parametres par methode ; un seul
+        est affiche a la fois via pack_forget()/pack(). Tous les sous-cadres
+        utilisent le style 'Carte.*' car ils vivent a l'interieur de la
+        LabelFrame blanche 'cadre_meth'."""
+        parent = self.cadre_methode_params
+
+        # -- I, IA, II, III : distributions SCS, pas de temps dynamique --
+        self.vars_pas_scs = {}
+        self.cadres_scs = {}
+        for type_scs in ("I", "IA", "II", "III"):
+            cadre = ttk.Frame(parent, style="Carte.TFrame")
+            lbl = ttk.Label(cadre, style="Carte.TLabel")
+            self._txt(lbl, "label_pas_temps")
+            lbl.grid(row=0, column=0, sticky="w", pady=5)
+            var_pas = tk.StringVar(value="60")
+            ttk.Entry(cadre, textvariable=var_pas, width=10).grid(row=0, column=1, sticky="w", padx=(6, 20))
+            note = ttk.Label(cadre, style="DiscretCarte.TLabel", wraplength=640, justify="left")
+            self._txt(note, "note_scs_officiel")
+            note.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            self.vars_pas_scs[type_scs] = var_pas
+            self.cadres_scs[type_scs] = cadre
+
+        # -- B : SCS saisie manuelle --
+        self.cadre_B = ttk.Frame(parent, style="Carte.TFrame")
+        lbl_b = ttk.Label(self.cadre_B, style="Carte.TLabel")
+        self._txt(lbl_b, "label_manuel_24")
+        lbl_b.pack(anchor="w")
+        self.var_b_texte = tk.StringVar()
+        ttk.Entry(self.cadre_B, textvariable=self.var_b_texte, width=80).pack(fill=tk.X, pady=6)
+        cadre_b_pas = ttk.Frame(self.cadre_B, style="Carte.TFrame")
+        cadre_b_pas.pack(fill=tk.X)
+        lbl_b_pas = ttk.Label(cadre_b_pas, style="Carte.TLabel")
+        self._txt(lbl_b_pas, "label_pas_temps")
+        lbl_b_pas.pack(side=tk.LEFT)
+        self.var_b_pas = tk.StringVar(value="60")
+        ttk.Entry(cadre_b_pas, textvariable=self.var_b_pas, width=10).pack(side=tk.LEFT, padx=(6, 0))
+        note_b = ttk.Label(self.cadre_B, style="DiscretCarte.TLabel", wraplength=640, justify="left")
+        self._txt(note_b, "note_manuel")
+        note_b.pack(anchor="w", pady=(6, 0))
+
+        # -- C : Methode des blocs alternes --
+        self.cadre_C = ttk.Frame(parent, style="Carte.TFrame")
+        lbl_a = ttk.Label(self.cadre_C, style="Carte.TLabel")
+        self._txt(lbl_a, "label_param_a")
+        lbl_a.grid(row=0, column=0, sticky="w", pady=5)
+        self.var_c_a = tk.StringVar(value="500")
+        ttk.Entry(self.cadre_C, textvariable=self.var_c_a, width=10).grid(row=0, column=1, sticky="w", padx=(6, 20))
+        lbl_b2 = ttk.Label(self.cadre_C, style="Carte.TLabel")
+        self._txt(lbl_b2, "label_param_b")
+        lbl_b2.grid(row=0, column=2, sticky="w", pady=5)
+        self.var_c_b = tk.StringVar(value="0.65")
+        ttk.Entry(self.cadre_C, textvariable=self.var_c_b, width=10).grid(row=0, column=3, sticky="w", padx=6)
+        lbl_duree = ttk.Label(self.cadre_C, style="Carte.TLabel")
+        self._txt(lbl_duree, "label_duree_totale")
+        lbl_duree.grid(row=1, column=0, sticky="w", pady=5)
+        self.var_c_duree = tk.StringVar(value="24")
+        ttk.Entry(self.cadre_C, textvariable=self.var_c_duree, width=10).grid(row=1, column=1, sticky="w", padx=(6, 20))
+        lbl_pas = ttk.Label(self.cadre_C, style="Carte.TLabel")
+        self._txt(lbl_pas, "label_pas_temps")
+        lbl_pas.grid(row=1, column=2, sticky="w", pady=5)
+        self.var_c_pas = tk.StringVar(value="60")
+        ttk.Entry(self.cadre_C, textvariable=self.var_c_pas, width=10).grid(row=1, column=3, sticky="w", padx=6)
+        note_c = ttk.Label(self.cadre_C, style="DiscretCarte.TLabel", wraplength=640, justify="left")
+        self._txt(note_c, "note_blocs_formule")
+        note_c.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        # -- D : triangulaire --
+        self.cadre_D = ttk.Frame(parent, style="Carte.TFrame")
+        lbl_d_duree = ttk.Label(self.cadre_D, style="Carte.TLabel")
+        self._txt(lbl_d_duree, "label_duree_totale")
+        lbl_d_duree.grid(row=0, column=0, sticky="w", pady=5)
+        self.var_d_duree = tk.StringVar(value="24")
+        ttk.Entry(self.cadre_D, textvariable=self.var_d_duree, width=10).grid(row=0, column=1, sticky="w", padx=(6, 20))
+        lbl_d_r = ttk.Label(self.cadre_D, style="Carte.TLabel")
+        self._txt(lbl_d_r, "label_coef_pointe")
+        lbl_d_r.grid(row=0, column=2, sticky="w", pady=5)
+        self.var_d_r = tk.StringVar(value="0.35")
+        ttk.Entry(self.cadre_D, textvariable=self.var_d_r, width=10).grid(row=0, column=3, sticky="w", padx=6)
+        lbl_d_pas = ttk.Label(self.cadre_D, style="Carte.TLabel")
+        self._txt(lbl_d_pas, "label_pas_temps")
+        lbl_d_pas.grid(row=1, column=0, sticky="w", pady=5)
+        self.var_d_pas = tk.StringVar(value="60")
+        ttk.Entry(self.cadre_D, textvariable=self.var_d_pas, width=10).grid(row=1, column=1, sticky="w", padx=(6, 20))
+        note_d = ttk.Label(self.cadre_D, style="DiscretCarte.TLabel", wraplength=640, justify="left")
+        self._txt(note_d, "note_triangulaire")
+        note_d.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        # -- E : fichier historique --
+        self.cadre_E = ttk.Frame(parent, style="Carte.TFrame")
+        lbl_e = ttk.Label(self.cadre_E, style="Carte.TLabel")
+        self._txt(lbl_e, "label_fichier_hist")
+        lbl_e.pack(anchor="w")
+        cadre_e_fichier = ttk.Frame(self.cadre_E, style="Carte.TFrame")
+        cadre_e_fichier.pack(fill=tk.X, pady=6)
+        self.var_e_fichier = tk.StringVar()
+        ttk.Entry(cadre_e_fichier, textvariable=self.var_e_fichier, state="readonly").pack(
+            side=tk.LEFT, fill=tk.X, expand=True)
+        b_e = ttk.Button(cadre_e_fichier, style="Secondaire.TButton",
+                         command=self._choisir_fichier_historique)
+        self._txt(b_e, "bouton_charger_fichier")
+        b_e.pack(side=tk.LEFT, padx=(10, 0))
+        cadre_e_pas = ttk.Frame(self.cadre_E, style="Carte.TFrame")
+        cadre_e_pas.pack(fill=tk.X)
+        lbl_e_pas = ttk.Label(cadre_e_pas, style="Carte.TLabel")
+        self._txt(lbl_e_pas, "label_pas_temps")
+        lbl_e_pas.pack(side=tk.LEFT)
+        self.var_e_pas = tk.StringVar(value="60")
+        ttk.Entry(cadre_e_pas, textvariable=self.var_e_pas, width=10).pack(side=tk.LEFT, padx=(6, 0))
+        note_e = ttk.Label(self.cadre_E, style="DiscretCarte.TLabel", wraplength=640, justify="left")
+        self._txt(note_e, "note_historique")
+        note_e.pack(anchor="w", pady=(6, 0))
+
+        self._cadres_par_methode = {
+            "I": self.cadres_scs["I"], "IA": self.cadres_scs["IA"],
+            "II": self.cadres_scs["II"], "III": self.cadres_scs["III"],
+            "B": self.cadre_B, "C": self.cadre_C, "D": self.cadre_D, "E": self.cadre_E,
+        }
+
+    def _afficher_cadre_methode(self):
+        for cadre in self._cadres_par_methode.values():
+            cadre.pack_forget()
+        nom_selectionne = self.var_methode.get()
+        methode_id = next((mid for mid, cle in self.methodes if self.T(cle) == nom_selectionne),
+                          self.methodes[0][0])
+        self._cadres_par_methode[methode_id].pack(fill=tk.X, pady=(4, 4))
+        self._methode_id_courante = methode_id
+
+    # ------------------------------------------------------------------
+    # PANNEAU HYETOGRAMME - DEUX graphiques matplotlib + table exacte.
+    #   Graphique 1 (gauche) : hyetogramme en barres (hauteur/pas, mm) +
+    #     courbe cumulee ADIMENSIONNELLE (0 a 1, axe secondaire).
+    #   Graphique 2 (droite) : comparateur adimensionnel t/duree vs
+    #     P_cumulee/P_totale - 4 courbes SCS standard en arriere-plan +
+    #     courbe de la methode actuellement calculee en surimpression.
+    # ------------------------------------------------------------------
+    def _construire_panneau_hyetogramme(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=6)
+        parent.rowconfigure(4, weight=1)
+
+        self.var_hyeto_resume = tk.StringVar(value=self.T("hyeto_resume_vide"))
+        label_resume = ttk.Label(parent, textvariable=self.var_hyeto_resume, style="Discret.TLabel",
+                                 wraplength=900, justify="left")
+        label_resume.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+
+        cadre_figure = ttk.Frame(parent)
+        cadre_figure.grid(row=1, column=0, sticky="nsew")
+        # constrained_layout=True : gestion automatique et continue des marges
+        # (remplace tight_layout, incompatible avec une legende deportee sous
+        # les axes via bbox_to_anchor - elle serait rognee a chaque redessin).
+        self.figure_hyeto = Figure(figsize=(13.0, 5.2), dpi=100, constrained_layout=True)
+        self.ax_hyeto = self.figure_hyeto.add_subplot(1, 2, 1)
+        self.ax_hyeto2 = self.ax_hyeto.twinx()
+        self.ax_compare = self.figure_hyeto.add_subplot(1, 2, 2)
+
+        self.canvas_hyeto = FigureCanvasTkAgg(self.figure_hyeto, master=cadre_figure)
+        self.canvas_hyeto.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._dessiner_hyetogramme_vide()
+
+        cadre_toolbar = ttk.Frame(parent)
+        cadre_toolbar.grid(row=2, column=0, sticky="ew")
+        self.toolbar_hyeto = NavigationToolbar2Tk(self.canvas_hyeto, cadre_toolbar)
+        self.toolbar_hyeto.update()
+
+        self.label_table_hint = ttk.Label(parent, style="Discret.TLabel")
+        self._txt(self.label_table_hint, "table_hint")
+        self.label_table_hint.grid(row=3, column=0, sticky="w", pady=(6, 2))
+
+        cadre_table = ttk.Frame(parent)
+        cadre_table.grid(row=4, column=0, sticky="nsew", pady=(0, 4))
+
+        colonnes = ("pas", "debut", "fin", "duree", "fraction", "hauteur", "intensite", "cumul")
+        cles_entetes = {
+            "pas": "col_pas", "debut": "col_debut", "fin": "col_fin", "duree": "col_duree",
+            "fraction": "col_fraction", "hauteur": "col_hauteur", "intensite": "col_intensite",
+            "cumul": "col_cumul",
+        }
+        largeurs = {"pas": 40, "debut": 70, "fin": 60, "duree": 70, "fraction": 80,
+                    "hauteur": 85, "intensite": 95, "cumul": 85}
+
+        self.table_hyeto = ttk.Treeview(cadre_table, columns=colonnes, show="headings", height=6)
+        for c in colonnes:
+            self._txt(self.table_hyeto, cles_entetes[c], heading_col=c)
+            self.table_hyeto.column(c, width=largeurs[c], anchor="center", stretch=True)
+        scrollbar_table_v = ttk.Scrollbar(cadre_table, orient="vertical", command=self.table_hyeto.yview)
+        self.table_hyeto.configure(yscrollcommand=scrollbar_table_v.set)
+        self.table_hyeto.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar_table_v.pack(side=tk.RIGHT, fill=tk.Y)
+        self.table_hyeto.bind("<<TreeviewSelect>>", self._on_select_ligne_hyeto)
+
+        self.label_unites_note = ttk.Label(parent, style="Discret.TLabel")
+        self._txt(self.label_unites_note, "unites_note")
+        self.label_unites_note.grid(row=5, column=0, sticky="w", pady=(2, 0))
+
+    # ------------------------------------------------------------------
+    def _dessiner_courbes_scs_reference(self):
+        """Trace, en arriere-plan du graphique comparateur, les 4 courbes SCS
+        standard normalisees (t/24h en abscisse, P/P24h en ordonnee). Les
+        courbes sont reechantillonnees toutes les 6 minutes par le meme
+        interpolateur monotone que le moteur de calcul, afin que ce qui est
+        AFFICHE corresponde exactement a ce qui serait CALCULE (les tables
+        Types I et III ont des noeuds espaces, un trace brut donnerait une
+        ligne brisee differente de la courbe reellement utilisee)."""
+        temps_min = [k * 6.0 for k in range(0, 241)]   # 0 -> 1440 min
+        x = [t / 1440.0 for t in temps_min]
+        for type_scs in ("I", "IA", "II", "III"):
+            y = interpoler_cumul_scs(type_scs, temps_min)
+            y[0], y[-1] = 0.0, 1.0
+            self.ax_compare.plot(x, y, color=self.COULEURS_SCS[type_scs],
+                                 linewidth=1.3, alpha=0.75, linestyle="--",
+                                 label="SCS Type {}".format(type_scs))
+
+    def _configurer_axes_comparateur(self):
+        self.ax_compare.set_title(self.T("titre_graph2"), fontsize=9, color=self.COULEUR_TITRE)
+        self.ax_compare.set_xlabel(self.T("xlabel_t_sur_t24"))
+        self.ax_compare.set_ylabel(self.T("ylabel_p_sur_p24"))
+        self.ax_compare.set_xlim(0, 1)
+        self.ax_compare.set_ylim(0, 1)
+        self.ax_compare.grid(True, color="#e5e7eb", linewidth=0.6)
+        self.ax_compare.legend(fontsize=6.5, loc="upper left")
+
+    def _dessiner_hyetogramme_vide(self):
+        self.ax_hyeto.clear()
+        self.ax_hyeto2.clear()
+        self.ax_hyeto.set_title(self.T("titre_graph_vide"), fontsize=10, color="#6b7280")
+        self.ax_hyeto.set_xlabel(self.T("xlabel_temps_min"))
+        self.ax_hyeto.set_ylabel(self.T("ylabel_hauteur_pas"), color=self.COULEUR_HYETO_BARRE)
+        self.ax_hyeto2.set_ylabel("Cumul reel (mm)", color=self.COULEUR_HYETO_CUMUL)
+        # Origine forcee a zero sur les trois axes : un hyetogramme se lit
+        # depuis t=0 et depuis une lame nulle, jamais depuis un minimum
+        # auto-echelonne par matplotlib.
+        self.ax_hyeto.set_xlim(left=0)
+        self.ax_hyeto.set_ylim(bottom=0)
+        self.ax_hyeto2.set_ylim(bottom=0)
+        self.ax_hyeto.grid(True, color="#e5e7eb", linewidth=0.6)
+        self._hyeto_barres = None
+
+        self.ax_compare.clear()
+        self._dessiner_courbes_scs_reference()
+        self._configurer_axes_comparateur()
+
+        # Aucun tight_layout ici : constrained_layout (defini a la creation de
+        # la figure) gere les marges en continu.
+        if self.canvas_hyeto is not None:
+            self.canvas_hyeto.draw_idle()
+
+    # ------------------------------------------------------------------
+    def _publier_hyetogramme(self, info):
+        """Appele depuis le thread d'arriere-plan (callback_hyetogramme) : ne
+        touche a AUCUN widget directement, se contente d'empiler l'info sur la
+        queue thread-safe deja utilisee pour les logs et la progression."""
+        self.log_queue.put(("hyeto", info))
+
+    # ------------------------------------------------------------------
+    def _afficher_hyetogramme(self, info):
+        """Execute uniquement dans le thread principal (via _poll_log_queue) :
+        met a jour LES DEUX graphiques matplotlib et la table Treeview avec
+        les donnees EXACTES recues du moteur de calcul (aucune approximation
+        supplementaire introduite cote GUI)."""
+        self.dernier_hyetogramme = info
+        table = info["table"]
+        n = len(table)
+        duree_totale_min = info.get("duree_totale_min") or (table[-1]["fin_min"] if table else 1.0)
+
+        self.var_hyeto_resume.set(self.T(
+            "hyeto_resume", methode=info["nom_methode"], lame=info["profondeur_totale_mm"],
+            n=n, duree=duree_totale_min / 60.0))
+
+        # -- Graphique 1 : barres (hauteur mm) + CUMUL REEL EN MILLIMETRES --
+        temps_min = [(l["debut_min"] + l["fin_min"]) / 2.0 for l in table]
+        largeurs = [max(l["duree_min"] * 0.9, 0.01) for l in table]
+        hauteurs = [abs(l["hauteur_mm"]) for l in table]
+        cumuls_adim = [l["cumul_adim"] for l in table]
+        # La courbe cumulee est indexee sur la FIN de chaque pas (et non sur
+        # son centre comme les barres) : c'est a cet instant que la lame
+        # cumulee vaut reellement cumul_mm. Le point (0, 0) initial ferme la
+        # courbe sur l'origine.
+        x_cumul = [0.0] + [l["fin_min"] for l in table]
+        y_cumul_mm = [0.0] + [l["cumul_mm"] for l in table]
+        idx_pic = max(range(n), key=lambda i: hauteurs[i]) if n else None
+
+        self.ax_hyeto.clear()
+        self.ax_hyeto2.clear()
+        couleurs = [self.COULEUR_HYETO_BARRE_SELECTION if i == idx_pic else self.COULEUR_HYETO_BARRE
+                    for i in range(n)]
+        self._hyeto_barres = self.ax_hyeto.bar(temps_min, hauteurs, width=largeurs, color=couleurs,
+                                               edgecolor="none", bottom=0, label="Pluie par pas")
+        self.ax_hyeto2.plot(x_cumul, y_cumul_mm, color=self.COULEUR_HYETO_CUMUL, linewidth=2.0,
+                            label="Cumul reel (mm)", zorder=5)
+
+        # Borne haute de l'axe cumule = lame totale + 5 %. Repli sur la
+        # derniere valeur cumulee si la lame de reference n'est pas finie
+        # (raster entierement NoData) : set_ylim(top=nan) leverait une erreur.
+        lame_totale_mm = info["profondeur_totale_mm"]
+        if not np.isfinite(lame_totale_mm) or lame_totale_mm <= 0:
+            lame_totale_mm = y_cumul_mm[-1] if np.isfinite(y_cumul_mm[-1]) else 0.0
+        self.ax_hyeto2.set_ylim(bottom=0, top=max(lame_totale_mm * 1.05, 1e-6))
+        self.ax_hyeto.set_ylim(bottom=0)
+        self.ax_hyeto.set_xlim(left=0)
+        self.ax_hyeto2.legend(fontsize=6.5, loc="upper center", bbox_to_anchor=(0.5, -0.16),
+                              frameon=False)
+        # Legende des barres sur l'axe primaire, en haut a droite : les deux
+        # legendes appartiennent a des axes differents (twinx) et ne peuvent
+        # pas etre fusionnees sans casser le placement deja valide de celle du
+        # cumul, deportee sous les axes.
+        self.ax_hyeto.legend(fontsize=6.5, loc="upper right", frameon=False)
+
+        self.ax_hyeto.set_title(self.T("titre_graph1", methode=info["nom_methode"]),
+                                fontsize=9, color=self.COULEUR_TITRE)
+        self.ax_hyeto.set_xlabel(self.T("xlabel_temps_min"))
+        # Label dynamique : la resolution reelle du hyetogramme est desormais
+        # lisible sur l'axe lui-meme (elle varie selon la methode et le pas).
+        pas_min = table[0]["duree_min"]
+        self.ax_hyeto.set_ylabel("Hauteur par pas de {:.1f} min (mm)".format(pas_min),
+                                 color=self.COULEUR_HYETO_BARRE)
+        self.ax_hyeto2.set_ylabel("Cumul reel (mm)", color=self.COULEUR_HYETO_CUMUL)
+        self.ax_hyeto.tick_params(axis="y", labelcolor=self.COULEUR_HYETO_BARRE)
+        self.ax_hyeto2.tick_params(axis="y", labelcolor=self.COULEUR_HYETO_CUMUL)
+        self.ax_hyeto.grid(True, color="#e5e7eb", linewidth=0.6)
+        if idx_pic is not None and np.isfinite(hauteurs[idx_pic]):
+            self.ax_hyeto.annotate(
+                self.T("annot_pic", valeur=hauteurs[idx_pic]),
+                xy=(temps_min[idx_pic], hauteurs[idx_pic]), fontsize=7.5,
+                color=self.COULEUR_HYETO_BARRE_SELECTION, xytext=(0, 6), textcoords="offset points",
+                ha="center")
+
+        # -- Graphique 2 : comparateur adimensionnel --
+        self.ax_compare.clear()
+        self._dessiner_courbes_scs_reference()
+        x_norm = [0.0] + [l["fin_min"] / duree_totale_min for l in table]
+        y_norm = [0.0] + cumuls_adim
+        self.ax_compare.plot(x_norm, y_norm, color=self.COULEUR_TITRE, linewidth=2.2,
+                             label=self.T("legende_methode_actuelle"), zorder=5)
+        self._configurer_axes_comparateur()
+
+        self.canvas_hyeto.draw_idle()
+
+        for item in self.table_hyeto.get_children():
+            self.table_hyeto.delete(item)
+        for l in table:
+            self.table_hyeto.insert("", tk.END, iid=str(l["pas"] - 1), values=(
+                l["pas"], "{:.1f}".format(l["debut_min"]), "{:.1f}".format(l["fin_min"]),
+                "{:.1f}".format(l["duree_min"]), "{:.4f}".format(l["fraction_pct"]),
+                "{:.4f}".format(l["hauteur_mm"]), "{:.4f}".format(l["intensite_mmh"]),
+                "{:.4f}".format(l["cumul_mm"]),
+            ))
+
+    # ------------------------------------------------------------------
+    def _on_select_ligne_hyeto(self, event=None):
+        """Interactivite table <-> graphique : selectionner une ligne de la
+        table met en evidence le bloc correspondant dans le graphique 1, sans
+        tout redessiner (juste la couleur des barres)."""
+        if not self._hyeto_barres:
+            return
+        selection = self.table_hyeto.selection()
+        if not selection:
+            return
+        try:
+            idx = int(selection[0])
+        except ValueError:
+            return
+        idx_pic = None
+        if self.dernier_hyetogramme:
+            hauteurs = [l["hauteur_mm"] for l in self.dernier_hyetogramme["table"]]
+            if hauteurs:
+                idx_pic = max(range(len(hauteurs)), key=lambda i: hauteurs[i])
+        for i, patch in enumerate(self._hyeto_barres):
+            if i == idx:
+                patch.set_color(self.COULEUR_HYETO_BARRE_SELECTION)
+            elif i == idx_pic:
+                patch.set_color(self.COULEUR_HYETO_BARRE_PIC)
+            else:
+                patch.set_color(self.COULEUR_HYETO_BARRE)
+        self.canvas_hyeto.draw_idle()
+
+    # ------------------------------------------------------------------
+    def _choisir_raster(self):
+        chemin = filedialog.askopenfilename(
+            title=self.T("dlg_raster"),
+            filetypes=[("GeoTIFF", "*.tif *.tiff"), (self.T("dlg_tous_fichiers"), "*.*")])
+        if chemin:
+            self.var_raster.set(chemin)
+            if not self.var_dossier_sortie.get():
+                self.var_dossier_sortie.set(str(Path(chemin).parent / "output_dss"))
+
+    def _choisir_shapefile(self):
+        chemin = filedialog.askopenfilename(
+            title=self.T("dlg_shp"),
+            filetypes=[("Shapefile", "*.shp"), (self.T("dlg_tous_fichiers"), "*.*")])
+        if chemin:
+            self.var_shp.set(chemin)
+
+    def _choisir_dossier_sortie(self):
+        chemin = filedialog.askdirectory(title=self.T("dlg_dossier"))
+        if chemin:
+            self.var_dossier_sortie.set(chemin)
+
+    def _choisir_fichier_historique(self):
+        chemin = filedialog.askopenfilename(
+            title=self.T("dlg_hist"),
+            filetypes=[("Texte / CSV", "*.txt *.csv"), (self.T("dlg_tous_fichiers"), "*.*")])
+        if chemin:
+            self.var_e_fichier.set(chemin)
+
+    # ------------------------------------------------------------------
+    # La queue transporte trois types de messages, distingues par un tag de
+    # type en premiere position du tuple :
+    #   ("log", (message, tag_couleur))  -> une ligne de la console
+    #   ("progress", pourcentage)        -> mise a jour de la barre determinate
+    #   ("hyeto", info)                  -> mise a jour des 2 graphiques + table
+    #   ("fin", resultat)                -> fin du traitement : reactivation du
+    #                                       bouton + boite de dialogue
+    # Le thread d'arriere-plan est seul a ecrire dans la queue ; seul le
+    # thread principal (via root.after) la lit et touche les widgets tkinter.
+    # ------------------------------------------------------------------
+    def _log(self, message, tag=None):
+        self.log_queue.put(("log", (message, tag)))
+
+    def _progress(self, pourcentage):
+        self.log_queue.put(("progress", pourcentage))
+
+    def _poll_log_queue(self):
+        try:
+            while True:
+                type_message, contenu = self.log_queue.get_nowait()
+                if type_message == "log":
+                    message, tag = contenu
+                    self.zone_log.configure(state="normal")
+                    self.zone_log.insert(tk.END, str(message) + "\n", tag if tag else ())
+                    self.zone_log.configure(state="disabled")
+                    self.zone_log.see(tk.END)
+                elif type_message == "progress":
+                    pct = max(0.0, min(100.0, float(contenu)))
+                    self.barre_progression["value"] = pct
+                    self.var_pct_label.set("{:.0f} %".format(pct))
+                elif type_message == "hyeto":
+                    self._afficher_hyetogramme(contenu)
+                elif type_message == "fin":
+                    self._traiter_fin_de_traitement(contenu)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_log_queue)
+
+    # ------------------------------------------------------------------
+    def _lire_float(self, var, nom_champ, permettre_vide=False):
+        texte = var.get().strip().replace(",", ".")
+        if texte == "" and permettre_vide:
+            return None
+        try:
+            valeur = float(texte)
+        except ValueError:
+            raise ErreurTraitement(
+                "Le champ '{}' doit etre un nombre valide (recu : '{}').".format(nom_champ, texte))
+        if not np.isfinite(valeur):
+            raise ErreurTraitement("Le champ '{}' doit etre un nombre fini.".format(nom_champ))
+        return valeur
+
+    def _collecter_params_methode(self, methode_id):
+        if methode_id in ("I", "IA", "II", "III"):
+            return {"pas_min": self._lire_float(self.vars_pas_scs[methode_id], "Pas de temps (min)")}
+        if methode_id == "B":
+            return {
+                "texte_manuel": self.var_b_texte.get(),
+                "pas_min": self._lire_float(self.var_b_pas, "Pas de temps (min)"),
+            }
+        if methode_id == "C":
+            return {
+                "a": self._lire_float(self.var_c_a, "Parametre a"),
+                "b": self._lire_float(self.var_c_b, "Parametre b"),
+                "duree_h": self._lire_float(self.var_c_duree, "Duree totale (h)"),
+                "pas_min": self._lire_float(self.var_c_pas, "Pas de temps (min)"),
+            }
+        if methode_id == "D":
+            return {
+                "duree_h": self._lire_float(self.var_d_duree, "Duree totale (h)"),
+                "r": self._lire_float(self.var_d_r, "Coefficient de pointe r"),
+                "pas_min": self._lire_float(self.var_d_pas, "Pas de temps (min)"),
+            }
+        if methode_id == "E":
+            chemin = self.var_e_fichier.get().strip()
+            if not chemin:
+                raise ErreurTraitement("[Pluie historique] Selectionne d'abord un fichier .txt/.csv.")
+            return {
+                "chemin_fichier": chemin,
+                "pas_min": self._lire_float(self.var_e_pas, "Pas de temps (min)"),
+            }
+        raise ErreurTraitement("Methode inconnue.")
+
+    # ------------------------------------------------------------------
+    def _lancer_traitement(self):
+        if self.traitement_en_cours:
+            messagebox.showinfo(self.T("info_traitement_encours_titre"), self.T("info_traitement_encours"))
+            return
+
+        chemin_raster = self.var_raster.get().strip()
+        chemin_shp = self.var_shp.get().strip()
+        dossier_sortie = self.var_dossier_sortie.get().strip()
+        faire_zp = self.var_zero_padding.get()
+        methode_id = self._methode_id_courante
+
+        if not chemin_raster:
+            messagebox.showerror(self.T("err_fichier_manquant_titre"), self.T("err_raster_manquant"))
+            return
+        if faire_zp and not chemin_shp:
+            messagebox.showerror(self.T("err_fichier_manquant_titre"), self.T("err_shp_manquant"))
+            return
+        if not dossier_sortie:
+            messagebox.showerror(self.T("err_dossier_manquant_titre"), self.T("err_dossier_manquant"))
+            return
+
+        try:
+            marge_m = self._lire_float(self.var_marge, "Marge Tampon (m)")
+            stress_pct = self._lire_float(self.var_stress, "Stress Climatique (%)")
+            params_methode = self._collecter_params_methode(methode_id)
+        except ErreurTraitement as e:
+            messagebox.showerror(self.T("err_param_invalide_titre"), str(e))
+            return
+
+        self.zone_log.configure(state="normal")
+        self.zone_log.delete("1.0", tk.END)
+        self.zone_log.configure(state="disabled")
+
+        self.traitement_en_cours = True
+        self.bouton_lancer.configure(state="disabled", text=self.T("bouton_lancer_encours"))
+        self.barre_progression["value"] = 0.0
+        self.var_pct_label.set("0 %")
+
+        thread = threading.Thread(
+            target=self._executer_en_arriere_plan,
+            args=(Path(chemin_raster), Path(chemin_shp) if chemin_shp else None, Path(dossier_sortie),
+                  marge_m, stress_pct, faire_zp, methode_id, params_methode),
+            daemon=True,
+        )
+        thread.start()
+
+    def _executer_en_arriere_plan(self, chemin_raster, chemin_shp, dossier_sortie,
+                                  marge_m, stress_pct, faire_zp, methode_id, params_methode):
+        """Corps du thread de traitement. Il n'appelle AUCUNE fonction tkinter
+        (ni widget, ni variable Tk, ni root.after) : tout ce qui doit etre
+        affiche - lignes de log, progression, hyetogramme, et desormais la
+        fin de traitement avec sa boite de dialogue - transite par la queue
+        thread-safe et n'est consomme que par le thread principal dans
+        _poll_log_queue(). Tkinter n'etant pas thread-safe, un appel direct
+        depuis ce thread peut lever "main thread is not in main loop" et
+        laisser l'interface bloquee avec le bouton desactive."""
+        try:
+            executer_traitement(chemin_raster, chemin_shp, dossier_sortie, marge_m, stress_pct,
+                                faire_zp, methode_id, params_methode, self._log,
+                                callback_progression=self._progress,
+                                callback_hyetogramme=self._publier_hyetogramme)
+            self._log("")
+            self._log(self.T("log_succes"), "succes")
+            self.log_queue.put(("fin", {"statut": "succes", "dossier": str(dossier_sortie)}))
+        except ErreurTraitement as e:
+            message = str(e)
+            self._log("")
+            self._log("[ERREUR] " + message, "erreur")
+            self.log_queue.put(("fin", {"statut": "erreur", "message": message}))
+        except Exception as e:
+            message = "{} : {}".format(type(e).__name__, e)
+            trace = traceback.format_exc()
+            self._log("")
+            self._log("[ERREUR INATTENDUE] " + message, "erreur")
+            self._log(trace, "erreur")
+            self.log_queue.put(("fin", {"statut": "erreur_inattendue", "message": message}))
+
+    def _traiter_fin_de_traitement(self, resultat):
+        """Execute dans le thread principal uniquement (via _poll_log_queue)."""
+        statut = resultat.get("statut")
+        self._reinitialiser_apres_traitement()
+        if statut == "succes":
+            messagebox.showinfo(self.T("succes_titre"),
+                                self.T("succes_msg", dossier=resultat.get("dossier", "")))
+        elif statut == "erreur":
+            messagebox.showerror(self.T("erreur_traitement_titre"), resultat.get("message", ""))
+        else:
+            messagebox.showerror(self.T("erreur_inattendue_titre"),
+                                 self.T("erreur_inattendue_msg", message=resultat.get("message", "")))
+
+    def _reinitialiser_apres_traitement(self):
+        self.traitement_en_cours = False
+        self.bouton_lancer.configure(state="normal", text=self.T("bouton_lancer"))
+        # La barre reste a sa valeur finale (100 % en cas de succes) pour
+        # confirmation visuelle ; elle est remise a 0 au prochain lancement.
+
+    def _fermer(self):
+        """Fermeture propre : on libere les liaisons globales de la molette et
+        la figure matplotlib avant de detruire la fenetre (sinon un thread de
+        traitement encore actif peut declencher des callbacks sur des widgets
+        deja detruits)."""
+        try:
+            self._canvas_principal.unbind_all("<MouseWheel>")
+            self._canvas_principal.unbind_all("<Button-4>")
+            self._canvas_principal.unbind_all("<Button-5>")
+        except tk.TclError:
+            pass
+        try:
+            self.figure_hyeto.clear()
+        except Exception:
+            pass
+        self.root.destroy()
+
+
+# ============================================================================
+# 6. POINT D'ENTREE
+# ============================================================================
+
+MODULES_OBLIGATOIRES = ("rasterio", "geopandas", "numpy", "matplotlib")
+MODULES_OPTIONNELS = ("scipy",)
+
+
+def verifier_dependances():
+    """Renvoie (manquantes_obligatoires, manquantes_optionnelles). scipy est
+    desormais OPTIONNEL : sans lui l'interpolation des tables SCS retombe sur
+    numpy.interp (lineaire, monotone), ce qui reste correct - l'application
+    n'a donc plus de raison de refuser de demarrer."""
+    manquantes = []
+    optionnelles = []
+    for module in MODULES_OBLIGATOIRES:
+        try:
+            __import__(module)
+        except ImportError:
+            manquantes.append(module)
+    for module in MODULES_OPTIONNELS:
+        try:
+            __import__(module)
+        except ImportError:
+            optionnelles.append(module)
+    return manquantes, optionnelles
+
+
+def main():
+    # Controle d'integrite des tables SCS : execute ICI (et non a l'import) de
+    # facon a pouvoir afficher une boite de dialogue lisible en version
+    # --windowed, ou aucun message console n'est visible.
+    try:
+        _controler_tables_scs()
+    except Exception as e:
+        root_tmp = tk.Tk()
+        root_tmp.withdraw()
+        messagebox.showerror(
+            "Tables SCS corrompues",
+            "Le controle d'integrite des tables de distribution SCS a echoue :\n\n{}\n\n"
+            "Le fichier source a probablement ete modifie. Restaure une version saine "
+            "de hec_vortex_preprocesseur.py avant de relancer l'application.".format(e))
+        root_tmp.destroy()
+        sys.exit(1)
+
+    manquantes, optionnelles = verifier_dependances()
+    if manquantes:
+        root_tmp = tk.Tk()
+        root_tmp.withdraw()
+        messagebox.showerror(
+            "Dependances manquantes",
+            "Modules Python manquants : {}\n\nInstalle-les avec :\npip install {}".format(
+                ", ".join(manquantes), " ".join(manquantes)))
+        root_tmp.destroy()
+        sys.exit(1)
+
+    root = tk.Tk()
+    app = HecVortexPreprocessorApp(root)
+    if optionnelles:
+        app._log("scipy n'est pas installe : interpolation lineaire (numpy.interp) utilisee pour "
+                 "les tables SCS au lieu de PCHIP. Resultat valide, mais legerement moins lisse.")
+        app._log("Installation recommandee : pip install scipy")
+        app._log("")
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
